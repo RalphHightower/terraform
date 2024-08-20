@@ -1874,8 +1874,8 @@ output "b" {
 				wantPlanned: map[string]cty.Value{
 					// test.b is deferred but still being planned. It being listed
 					// here does not mean it's in the plan.
-					"<unknown>": cty.ObjectVal(map[string]cty.Value{
-						"name":           cty.UnknownVal(cty.String),
+					"deferred_read": cty.ObjectVal(map[string]cty.Value{
+						"name":           cty.StringVal("deferred_read"),
 						"output":         cty.UnknownVal(cty.String),
 						"upstream_names": cty.NullVal(cty.Set(cty.String)),
 					}),
@@ -2106,11 +2106,11 @@ output "a" {
 				// the current concrete value (not a cty.NullVal), even though
 				// the resource "is deferred."
 				wantOutputs: map[string]cty.Value{
-					"a": cty.ObjectVal(map[string]cty.Value{
-						"name":           cty.StringVal("deferred_resource_change"),
-						"upstream_names": cty.NullVal(cty.Set(cty.String)),
-						"output":         cty.StringVal("computed_output"),
-					}),
+					"a": cty.NullVal(cty.Object(map[string]cty.Type{
+						"name":           cty.String,
+						"upstream_names": cty.Set(cty.String),
+						"output":         cty.String,
+					})),
 				},
 				wantDeferred: map[string]ExpectedDeferred{
 					"test.a": {Reason: providers.DeferredReasonProviderConfigUnknown, Action: plans.NoOp},
@@ -2915,7 +2915,7 @@ import {
 				wantDeferred: make(map[string]ExpectedDeferred),
 				wantDiagnostic: func(diags tfdiags.Diagnostics) bool {
 					for _, diag := range diags {
-						if diag.Description().Summary == "Configuration for import target does not exist" {
+						if diag.Description().Summary == "Use of import for_each in an invalid context" {
 							return true
 						}
 					}
@@ -3010,6 +3010,129 @@ data "test" "b" {
 			},
 		},
 	}
+
+	resourceReferencesDeferredDataSource = deferredActionsTest{
+		configs: map[string]string{
+			"main.tf": `
+
+variable "create" {
+	type = bool
+}
+
+data "test" "a" {
+	count = var.create ? 1 : 0
+	name = "foo"
+}
+
+resource "test" "a" {
+	count = var.create ? 1 : 0
+	name = data.test.a[0].output
+}
+`,
+		},
+		stages: []deferredActionsTestStage{
+			{
+				buildOpts: func(opts *PlanOpts) {
+					// mark everything as deferred
+					opts.ExternalDependencyDeferred = true
+				},
+				inputs: map[string]cty.Value{
+					"create": cty.BoolVal(true),
+				},
+				wantPlanned: map[string]cty.Value{
+					"foo": cty.ObjectVal(map[string]cty.Value{
+						"name":           cty.StringVal("foo"),
+						"upstream_names": cty.NullVal(cty.Set(cty.String)),
+						"output":         cty.UnknownVal(cty.String),
+					}),
+				},
+				wantActions: make(map[string]plans.Action),
+				wantDeferred: map[string]ExpectedDeferred{
+					"data.test.a[0]": {Reason: providers.DeferredReasonDeferredPrereq, Action: plans.Read},
+					"test.a[0]":      {Reason: providers.DeferredReasonDeferredPrereq, Action: plans.Create},
+				},
+				complete: false,
+			},
+		},
+	}
+
+	resourceReferencesUnknownAndDeferredDataSource = deferredActionsTest{
+		configs: map[string]string{
+			"main.tf": `
+variable "name" {
+	type = string
+}
+
+data "test" "a" {
+	name       = "deferred_read"
+}
+
+resource "test" "b" {
+	name = data.test.a.name
+}
+	`,
+		},
+		stages: []deferredActionsTestStage{
+			{
+				buildOpts: func(opts *PlanOpts) {
+					// mark everything as deferred
+					opts.ExternalDependencyDeferred = true
+				},
+				inputs: map[string]cty.Value{
+					"name": cty.UnknownVal(cty.String),
+				},
+				wantPlanned: map[string]cty.Value{
+					"deferred_read": cty.ObjectVal(map[string]cty.Value{
+						"name":           cty.StringVal("deferred_read"),
+						"upstream_names": cty.NullVal(cty.Set(cty.String)),
+						"output":         cty.UnknownVal(cty.String),
+					}),
+				},
+				wantActions: map[string]plans.Action{},
+				wantDeferred: map[string]ExpectedDeferred{
+					"data.test.a": {Reason: providers.DeferredReasonProviderConfigUnknown, Action: plans.Read},
+					"test.b":      {Reason: providers.DeferredReasonDeferredPrereq, Action: plans.Create},
+				},
+				complete: false,
+			},
+		},
+	}
+
+	createAndReferenceResourceInDeferredComponent = deferredActionsTest{
+		configs: map[string]string{
+			"main.tf": `
+resource "test" "a" {
+	count = 1
+	name = "a"
+}
+
+resource "test" "b" {
+	name = test.a[0].name
+}
+`,
+		},
+		stages: []deferredActionsTestStage{
+			{
+				buildOpts: func(opts *PlanOpts) {
+					opts.ExternalDependencyDeferred = true
+				},
+				inputs: map[string]cty.Value{},
+				wantPlanned: map[string]cty.Value{
+					"a": cty.ObjectVal(map[string]cty.Value{
+						"name":           cty.StringVal("a"),
+						"upstream_names": cty.NullVal(cty.Set(cty.String)),
+						"output":         cty.UnknownVal(cty.String),
+					}),
+				},
+				wantActions: map[string]plans.Action{},
+				wantDeferred: map[string]ExpectedDeferred{
+					"test.a[0]": {Reason: providers.DeferredReasonDeferredPrereq, Action: plans.Create},
+					"test.b":    {Reason: providers.DeferredReasonDeferredPrereq, Action: plans.Create},
+				},
+				complete: false,
+			},
+		},
+	}
 )
 
 func TestContextApply_deferredActions(t *testing.T) {
@@ -3052,6 +3175,9 @@ func TestContextApply_deferredActions(t *testing.T) {
 		"unknown_import_reports_missing_configuration":            unknownImportReportsMissingConfiguration,
 		"data_source_depends_on_deferred_resource":                dataSourceDependsOnDeferredResource,
 		"data_source_depends_on_deferred_resource_during_refresh": dataSourceDependsOnDeferredResourceDuringRefresh,
+		"resource_references_deferred_data_source":                resourceReferencesDeferredDataSource,
+		"resource_references_unknown_and_deferred_data_source":    resourceReferencesUnknownAndDeferredDataSource,
+		"create_and_reference_resource_in_deferred_component":     createAndReferenceResourceInDeferredComponent,
 	}
 
 	for name, test := range tests {
@@ -3110,9 +3236,16 @@ func TestContextApply_deferredActions(t *testing.T) {
 
 					var plan *plans.Plan
 					t.Run("plan", func(t *testing.T) {
-
 						var diags tfdiags.Diagnostics
-						plan, diags = ctx.Plan(cfg, state, opts)
+
+						// Validate is run by default for any plan from the CLI
+						diags = diags.Append(ctx.Validate(cfg, &ValidateOpts{}))
+						// Plan won't proceed if validate failed
+						if !diags.HasErrors() {
+							p, pDiags := ctx.Plan(cfg, state, opts)
+							diags = diags.Append(pDiags)
+							plan = p
+						}
 
 						if stage.wantDiagnostic == nil {
 							// We expect the correct planned changes and no diagnostics.
@@ -3123,7 +3256,7 @@ func TestContextApply_deferredActions(t *testing.T) {
 							}
 						} else {
 							if !stage.wantDiagnostic(diags) {
-								t.Fatalf("missing expected diagnostics: %s", diags)
+								t.Fatalf("missing expected diagnostics: %s", diags.ErrWithWarnings())
 							} else {
 								// We don't want to make any further assertions in this case.
 								// If diagnostics are expected it's valid that no plan may be returned.

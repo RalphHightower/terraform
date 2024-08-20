@@ -1382,12 +1382,13 @@ func TestApplyWithStateManipulation(t *testing.T) {
 	)
 
 	tcs := map[string]struct {
-		state            *stackstate.State
-		store            *stacks_testing_provider.ResourceStore
-		inputs           map[string]cty.Value
-		changes          []stackstate.AppliedChange
-		counts           collections.Map[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange]
-		expectedWarnings []string
+		state      *stackstate.State
+		store      *stacks_testing_provider.ResourceStore
+		inputs     map[string]cty.Value
+		changes    []stackstate.AppliedChange
+		counts     collections.Map[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange]
+		planDiags  []expectedDiagnostic
+		applyDiags []expectedDiagnostic
 	}{
 		"moved": {
 			state: stackstate.NewStateBuilder().
@@ -1438,6 +1439,72 @@ func TestApplyWithStateManipulation(t *testing.T) {
 					},
 				}),
 		},
+		"moved-failed-dep": {
+			state: stackstate.NewStateBuilder().
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.self.testing_resource.before")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						Status: states.ObjectReady,
+						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+							"id":    "moved",
+							"value": "moved",
+						}),
+					})).
+				Build(),
+			store: stacks_testing_provider.NewResourceStoreBuilder().
+				AddResource("moved", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("moved"),
+					"value": cty.StringVal("moved"),
+				})).
+				Build(),
+			changes: []stackstate.AppliedChange{
+				&stackstate.AppliedChangeComponentInstance{
+					ComponentAddr:         mustAbsComponent("component.self"),
+					ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+					OutputValues:          make(map[addrs.OutputValue]cty.Value),
+				},
+				&stackstate.AppliedChangeResourceInstanceObject{
+					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_failed_resource.resource"),
+					ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+				},
+				&stackstate.AppliedChangeResourceInstanceObject{
+					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.after"),
+					NewStateSrc: &states.ResourceInstanceObjectSrc{
+						AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+							"id":    "moved",
+							"value": "moved",
+						}),
+						Status:             states.ObjectReady,
+						AttrSensitivePaths: make([]cty.Path, 0),
+						Dependencies: []addrs.ConfigResource{
+							{
+								Resource: addrs.Resource{
+									Mode: addrs.ManagedResourceMode,
+									Type: "testing_failed_resource",
+									Name: "resource",
+								},
+							},
+						},
+					},
+					ProviderConfigAddr:                 mustDefaultRootProvider("testing"),
+					PreviousResourceInstanceObjectAddr: mustAbsResourceInstanceObjectPtr("component.self.testing_resource.before"),
+					Schema:                             stacks_testing_provider.TestingResourceSchema,
+				},
+			},
+			counts: collections.NewMap[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange](
+				collections.MapElem[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange]{
+					K: mustAbsComponentInstance("component.self"),
+					V: &hooks.ComponentInstanceChange{
+						Addr: mustAbsComponentInstance("component.self"),
+						Move: 1,
+					},
+				}),
+			applyDiags: []expectedDiagnostic{
+				// This error comes from the testing_failed_resource
+				expectDiagnostic(tfdiags.Error, "planned failure", "apply failure"),
+			},
+		},
 		"import": {
 			state: stackstate.NewStateBuilder().Build(), // We start with an empty state for this.
 			store: stacks_testing_provider.NewResourceStoreBuilder().
@@ -1478,6 +1545,63 @@ func TestApplyWithStateManipulation(t *testing.T) {
 					},
 				}),
 		},
+		"import-failed-dep": {
+			state: stackstate.NewStateBuilder().Build(), // We start with an empty state for this.
+			store: stacks_testing_provider.NewResourceStoreBuilder().
+				AddResource("imported", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("imported"),
+					"value": cty.StringVal("imported"),
+				})).
+				Build(),
+			inputs: map[string]cty.Value{
+				"id": cty.StringVal("imported"),
+			},
+			changes: []stackstate.AppliedChange{
+				&stackstate.AppliedChangeComponentInstance{
+					ComponentAddr:         mustAbsComponent("component.self"),
+					ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+					OutputValues:          make(map[addrs.OutputValue]cty.Value),
+				},
+				&stackstate.AppliedChangeResourceInstanceObject{
+					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_failed_resource.resource"),
+					ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+				},
+				&stackstate.AppliedChangeResourceInstanceObject{
+					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+					NewStateSrc: &states.ResourceInstanceObjectSrc{
+						AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+							"id":    "imported",
+							"value": "imported",
+						}),
+						Status:             states.ObjectReady,
+						AttrSensitivePaths: make([]cty.Path, 0),
+						Dependencies: []addrs.ConfigResource{
+							{
+								Resource: addrs.Resource{
+									Mode: addrs.ManagedResourceMode,
+									Type: "testing_failed_resource",
+									Name: "resource",
+								},
+							},
+						},
+					},
+					ProviderConfigAddr: mustDefaultRootProvider("testing"),
+					Schema:             stacks_testing_provider.TestingResourceSchema,
+				},
+			},
+			counts: collections.NewMap[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange](
+				collections.MapElem[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange]{
+					K: mustAbsComponentInstance("component.self"),
+					V: &hooks.ComponentInstanceChange{
+						Addr:   mustAbsComponentInstance("component.self"),
+						Import: 1,
+					},
+				}),
+			applyDiags: []expectedDiagnostic{
+				// This error comes from the testing_failed_resource
+				expectDiagnostic(tfdiags.Error, "planned failure", "apply failure"),
+			},
+		},
 		"removed": {
 			state: stackstate.NewStateBuilder().
 				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
@@ -1517,7 +1641,60 @@ func TestApplyWithStateManipulation(t *testing.T) {
 						Forget: 1,
 					},
 				}),
-			expectedWarnings: []string{"Some objects will no longer be managed by Terraform"},
+			planDiags: []expectedDiagnostic{
+				expectDiagnostic(tfdiags.Warning, "Some objects will no longer be managed by Terraform", "If you apply this plan, Terraform will discard its tracking information for the following objects, but it will not delete them:\n - testing_resource.resource\n\nAfter applying this plan, Terraform will no longer manage these objects. You will need to import them into Terraform to manage them again."),
+			},
+		},
+		"removed-failed-dep": {
+			state: stackstate.NewStateBuilder().
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.self.testing_resource.resource")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						Status: states.ObjectReady,
+						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+							"id":    "removed",
+							"value": "removed",
+						}),
+					})).
+				Build(),
+			store: stacks_testing_provider.NewResourceStoreBuilder().
+				AddResource("removed", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("removed"),
+					"value": cty.StringVal("removed"),
+				})).
+				Build(),
+			changes: []stackstate.AppliedChange{
+				&stackstate.AppliedChangeComponentInstance{
+					ComponentAddr:         mustAbsComponent("component.self"),
+					ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+					OutputValues:          make(map[addrs.OutputValue]cty.Value),
+				},
+				&stackstate.AppliedChangeResourceInstanceObject{
+					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_failed_resource.resource"),
+					ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+				},
+				&stackstate.AppliedChangeResourceInstanceObject{
+					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.resource"),
+					NewStateSrc:                nil, // Deleted, so is nil.
+					ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+				},
+			},
+			counts: collections.NewMap[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange](
+				collections.MapElem[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange]{
+					K: mustAbsComponentInstance("component.self"),
+					V: &hooks.ComponentInstanceChange{
+						Addr:   mustAbsComponentInstance("component.self"),
+						Forget: 1,
+					},
+				}),
+			planDiags: []expectedDiagnostic{
+				expectDiagnostic(tfdiags.Warning, "Some objects will no longer be managed by Terraform", "If you apply this plan, Terraform will discard its tracking information for the following objects, but it will not delete them:\n - testing_resource.resource\n\nAfter applying this plan, Terraform will no longer manage these objects. You will need to import them into Terraform to manage them again."),
+			},
+			applyDiags: []expectedDiagnostic{
+				// This error comes from the testing_failed_resource
+				expectDiagnostic(tfdiags.Error, "planned failure", "apply failure"),
+			},
 		},
 		"deferred": {
 			store: stacks_testing_provider.NewResourceStoreBuilder().
@@ -1608,19 +1785,9 @@ func TestApplyWithStateManipulation(t *testing.T) {
 			}
 			go Plan(ctx, &planReq, &planResp)
 			planChanges, diags := collectPlanOutput(planChangeCh, diagsCh)
-			reportDiagnosticsForTest(t, diags)
-			if diags.HasErrors() {
-				// we reported the diagnostics above, so we can just fail now
-				t.FailNow()
-			}
-			if len(diags) > len(tc.expectedWarnings) {
-				t.Fatalf("had unexpected warnings")
-			}
-			for i, diag := range diags {
-				if diag.Description().Summary != tc.expectedWarnings[i] {
-					t.Fatalf("expected diagnostic with summary %q, got %q", tc.expectedWarnings[i], diag.Description().Summary)
-				}
-			}
+
+			sort.SliceStable(diags, diagnosticSortFunc(diags))
+			expectDiagnosticsForTest(t, diags, tc.planDiags...)
 
 			// Check the counts during the apply for this test.
 			gotCounts := collections.NewMap[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange]()
@@ -1665,14 +1832,9 @@ func TestApplyWithStateManipulation(t *testing.T) {
 
 			go Apply(ctx, &applyReq, &applyResp)
 			applyChanges, diags := collectApplyOutput(applyChangesCh, diagsCh)
-			reportDiagnosticsForTest(t, diags)
-			if diags.HasErrors() {
-				// we reported the diagnostics above, so we can just fail now
-				t.FailNow()
-			}
-			if len(diags) > 0 {
-				t.Fatalf("expected no diagnostics, got %s", diags.ErrWithWarnings())
-			}
+
+			sort.SliceStable(diags, diagnosticSortFunc(diags))
+			expectDiagnosticsForTest(t, diags, tc.applyDiags...)
 
 			sort.SliceStable(applyChanges, func(i, j int) bool {
 				return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
@@ -1707,7 +1869,7 @@ func TestApplyWithStateManipulation(t *testing.T) {
 	}
 }
 
-func TestApplyWithChangedValues(t *testing.T) {
+func TestApplyWithChangedInputValues(t *testing.T) {
 	ctx := context.Background()
 	cfg := loadMainBundleConfigForTest(t, filepath.Join("with-single-input", "valid"))
 
@@ -1772,8 +1934,690 @@ func TestApplyWithChangedValues(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Now deliberately edit the plan so that it'll produce different outputs.
-	plan.RootInputValues[stackaddrs.InputVariable{Name: "input"}] = cty.StringVal("world")
+	applyReq := ApplyRequest{
+		Config: cfg,
+		Plan:   plan,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			// This time we're deliberately changing the values we're giving
+			// to the apply operation. We expect this to fail earlier than
+			// the previous test.
+			stackaddrs.InputVariable{Name: "input"}: {
+				Value: cty.StringVal("world"),
+			},
+		},
+	}
+
+	applyChangesCh := make(chan stackstate.AppliedChange)
+	diagsCh = make(chan tfdiags.Diagnostic)
+
+	applyResp := ApplyResponse{
+		AppliedChanges: applyChangesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Apply(ctx, &applyReq, &applyResp)
+	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
+	if len(applyDiags) != 1 {
+		t.Fatalf("expected exactly two diagnostics, got %s", applyDiags.ErrWithWarnings())
+	}
+
+	sort.SliceStable(applyDiags, diagnosticSortFunc(applyDiags))
+	expectDiagnosticsForTest(t, applyDiags,
+		expectDiagnostic(
+			tfdiags.Error,
+			"Inconsistent value for input variable during apply",
+			"The value for non-ephemeral input variable \"input\" was set to a different value during apply than was set during plan. Only ephemeral input variables can change between the plan and apply phases."),
+	)
+
+	wantChanges := []stackstate.AppliedChange{
+		&stackstate.AppliedChangeComponentInstance{
+			ComponentAddr:         mustAbsComponent("component.self"),
+			ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+			OutputValues:          make(map[addrs.OutputValue]cty.Value),
+		},
+		// no resources should have been created because the input variable was
+		// invalid.
+	}
+
+	sort.SliceStable(applyChanges, func(i, j int) bool {
+		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
+	})
+
+	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+		t.Errorf("wrong changes\n%s", diff)
+	}
+}
+
+func TestApplyAutomaticInputConversion(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadMainBundleConfigForTest(t, filepath.Join("with-single-input", "for-each-component"))
+
+	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changesCh := make(chan stackplan.PlannedChange)
+	diagsCh := make(chan tfdiags.Diagnostic)
+	lock := depsfile.NewLocks()
+	lock.SetProvider(
+		addrs.NewDefaultProvider("testing"),
+		providerreqs.MustParseVersion("0.0.0"),
+		providerreqs.MustParseVersionConstraints("=0.0.0"),
+		providerreqs.PreferredHashes([]providerreqs.Hash{}),
+	)
+	req := PlanRequest{
+		Config: cfg,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+
+		ForcePlanTimestamp: &fakePlanTimestamp,
+
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			stackaddrs.InputVariable{Name: "input"}: {
+				// The stack expects a map of strings, but we're giving it
+				// an object. Terraform should automatically convert this to
+				// the expected type.
+				Value: cty.ObjectVal(map[string]cty.Value{
+					"hello": cty.StringVal("hello"),
+					"world": cty.StringVal("world"),
+				}),
+			},
+		},
+	}
+
+	resp := PlanResponse{
+		PlannedChanges: changesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Plan(ctx, &req, &resp)
+	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
+	if len(planDiags) > 0 {
+		t.Fatalf("expected no diagnostics, got %s", planDiags.ErrWithWarnings())
+	}
+
+	planLoader := stackplan.NewLoader()
+	for _, change := range planChanges {
+		proto, err := change.PlannedChangeProto()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, rawMsg := range proto.Raw {
+			err = planLoader.AddRaw(rawMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	plan, err := planLoader.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applyReq := ApplyRequest{
+		Config: cfg,
+		Plan:   plan,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			stackaddrs.InputVariable{Name: "input"}: {
+				// The stack expects a map of strings, but we're giving it
+				// an object. Terraform should automatically convert this to
+				// the expected type.
+				Value: cty.ObjectVal(map[string]cty.Value{
+					"hello": cty.StringVal("hello"),
+					"world": cty.StringVal("world"),
+				}),
+			},
+		},
+	}
+
+	applyChangesCh := make(chan stackstate.AppliedChange)
+	diagsCh = make(chan tfdiags.Diagnostic)
+
+	applyResp := ApplyResponse{
+		AppliedChanges: applyChangesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Apply(ctx, &applyReq, &applyResp)
+	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
+	if len(applyDiags) > 0 {
+		t.Fatalf("expected no diagnostics, got %s", applyDiags.ErrWithWarnings())
+	}
+
+	sort.SliceStable(applyChanges, func(i, j int) bool {
+		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
+	})
+
+	wantChanges := []stackstate.AppliedChange{
+		&stackstate.AppliedChangeComponentInstance{
+			ComponentAddr:         mustAbsComponent("component.self"),
+			ComponentInstanceAddr: mustAbsComponentInstance("component.self[\"hello\"]"),
+			OutputValues:          make(map[addrs.OutputValue]cty.Value),
+		},
+		&stackstate.AppliedChangeResourceInstanceObject{
+			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"hello\"].testing_resource.data"),
+			NewStateSrc: &states.ResourceInstanceObjectSrc{
+				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+					"id":    "hello",
+					"value": "hello",
+				}),
+				Status:       states.ObjectReady,
+				Dependencies: make([]addrs.ConfigResource, 0),
+			},
+			ProviderConfigAddr: mustDefaultRootProvider("testing"),
+			Schema:             stacks_testing_provider.TestingResourceSchema,
+		},
+		&stackstate.AppliedChangeComponentInstance{
+			ComponentAddr:         mustAbsComponent("component.self"),
+			ComponentInstanceAddr: mustAbsComponentInstance("component.self[\"world\"]"),
+			OutputValues:          make(map[addrs.OutputValue]cty.Value),
+		},
+		&stackstate.AppliedChangeResourceInstanceObject{
+			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"world\"].testing_resource.data"),
+			NewStateSrc: &states.ResourceInstanceObjectSrc{
+				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+					"id":    "world",
+					"value": "world",
+				}),
+				Status:       states.ObjectReady,
+				Dependencies: make([]addrs.ConfigResource, 0),
+			},
+			ProviderConfigAddr: mustDefaultRootProvider("testing"),
+			Schema:             stacks_testing_provider.TestingResourceSchema,
+		},
+	}
+
+	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+		t.Errorf("wrong changes\n%s", diff)
+	}
+}
+
+func TestApplyEphemeralInput(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadMainBundleConfigForTest(t, filepath.Join("with-single-input", "ephemeral"))
+
+	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changesCh := make(chan stackplan.PlannedChange)
+	diagsCh := make(chan tfdiags.Diagnostic)
+	lock := depsfile.NewLocks()
+	lock.SetProvider(
+		addrs.NewDefaultProvider("testing"),
+		providerreqs.MustParseVersion("0.0.0"),
+		providerreqs.MustParseVersionConstraints("=0.0.0"),
+		providerreqs.PreferredHashes([]providerreqs.Hash{}),
+	)
+	req := PlanRequest{
+		Config: cfg,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+
+		ForcePlanTimestamp: &fakePlanTimestamp,
+
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			stackaddrs.InputVariable{Name: "input"}: {
+				Value: cty.StringVal("hello"),
+			},
+			stackaddrs.InputVariable{Name: "ephemeral"}: {
+				Value: cty.StringVal("ephemeral"),
+			},
+		},
+	}
+
+	resp := PlanResponse{
+		PlannedChanges: changesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Plan(ctx, &req, &resp)
+	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
+	if len(planDiags) > 0 {
+		t.Fatalf("expected no diagnostics, got %s", planDiags.ErrWithWarnings())
+	}
+
+	planLoader := stackplan.NewLoader()
+	for _, change := range planChanges {
+		proto, err := change.PlannedChangeProto()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, rawMsg := range proto.Raw {
+			err = planLoader.AddRaw(rawMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	plan, err := planLoader.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applyReq := ApplyRequest{
+		Config: cfg,
+		Plan:   plan,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			stackaddrs.InputVariable{Name: "input"}: {
+				Value: cty.StringVal("hello"),
+			},
+			stackaddrs.InputVariable{Name: "ephemeral"}: {
+				// This has changed, and that should be okay.
+				Value: cty.StringVal("applying"),
+			},
+		},
+	}
+
+	applyChangesCh := make(chan stackstate.AppliedChange)
+	diagsCh = make(chan tfdiags.Diagnostic)
+
+	applyResp := ApplyResponse{
+		AppliedChanges: applyChangesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Apply(ctx, &applyReq, &applyResp)
+	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
+	if len(applyDiags) > 0 {
+		t.Fatalf("expected no diagnostics, got %s", applyDiags.ErrWithWarnings())
+	}
+
+	sort.SliceStable(applyChanges, func(i, j int) bool {
+		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
+	})
+
+	wantChanges := []stackstate.AppliedChange{
+		&stackstate.AppliedChangeComponentInstance{
+			ComponentAddr:         mustAbsComponent("component.self"),
+			ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+			OutputValues:          make(map[addrs.OutputValue]cty.Value),
+		},
+		&stackstate.AppliedChangeResourceInstanceObject{
+			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+			NewStateSrc: &states.ResourceInstanceObjectSrc{
+				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+					"id":    "2f9f3b84",
+					"value": "hello",
+				}),
+				Status:       states.ObjectReady,
+				Dependencies: make([]addrs.ConfigResource, 0),
+			},
+			ProviderConfigAddr: mustDefaultRootProvider("testing"),
+			Schema:             stacks_testing_provider.TestingResourceSchema,
+		},
+	}
+
+	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+		t.Errorf("wrong changes\n%s", diff)
+	}
+}
+
+func TestApplyMissingEphemeralInput(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadMainBundleConfigForTest(t, filepath.Join("with-single-input", "ephemeral"))
+
+	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changesCh := make(chan stackplan.PlannedChange)
+	diagsCh := make(chan tfdiags.Diagnostic)
+	lock := depsfile.NewLocks()
+	lock.SetProvider(
+		addrs.NewDefaultProvider("testing"),
+		providerreqs.MustParseVersion("0.0.0"),
+		providerreqs.MustParseVersionConstraints("=0.0.0"),
+		providerreqs.PreferredHashes([]providerreqs.Hash{}),
+	)
+	req := PlanRequest{
+		Config: cfg,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+
+		ForcePlanTimestamp: &fakePlanTimestamp,
+
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			stackaddrs.InputVariable{Name: "input"}: {
+				Value: cty.StringVal("hello"),
+			},
+			stackaddrs.InputVariable{Name: "ephemeral"}: {
+				Value: cty.StringVal("ephemeral"),
+			},
+		},
+	}
+
+	resp := PlanResponse{
+		PlannedChanges: changesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Plan(ctx, &req, &resp)
+	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
+	if len(planDiags) > 0 {
+		t.Fatalf("expected no diagnostics, got %s", planDiags.ErrWithWarnings())
+	}
+
+	planLoader := stackplan.NewLoader()
+	for _, change := range planChanges {
+		proto, err := change.PlannedChangeProto()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, rawMsg := range proto.Raw {
+			err = planLoader.AddRaw(rawMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	plan, err := planLoader.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applyReq := ApplyRequest{
+		Config: cfg,
+		Plan:   plan,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			stackaddrs.InputVariable{Name: "input"}: {
+				Value: cty.StringVal("hello"),
+			},
+		},
+	}
+
+	applyChangesCh := make(chan stackstate.AppliedChange)
+	diagsCh = make(chan tfdiags.Diagnostic)
+
+	applyResp := ApplyResponse{
+		AppliedChanges: applyChangesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Apply(ctx, &applyReq, &applyResp)
+	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
+	if len(applyDiags) != 1 {
+		t.Fatalf("expected exactly 1 diagnostic, got %s", applyDiags.ErrWithWarnings())
+	}
+
+	gotSeverity, wantSeverity := applyDiags[0].Severity(), tfdiags.Error
+	gotSummary, wantSummary := applyDiags[0].Description().Summary, "No value for required variable"
+	gotDetail, wantDetail := applyDiags[0].Description().Detail, "The root input variable \"var.ephemeral\" is not set, and has no default value."
+
+	if gotSeverity != wantSeverity {
+		t.Errorf("expected severity %q, got %q", wantSeverity, gotSeverity)
+	}
+	if gotSummary != wantSummary {
+		t.Errorf("expected summary %q, got %q", wantSummary, gotSummary)
+	}
+	if gotDetail != wantDetail {
+		t.Errorf("expected detail %q, got %q", wantDetail, gotDetail)
+	}
+
+	sort.SliceStable(applyChanges, func(i, j int) bool {
+		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
+	})
+
+	wantChanges := []stackstate.AppliedChange{
+		&stackstate.AppliedChangeComponentInstance{
+			ComponentAddr:         mustAbsComponent("component.self"),
+			ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+			OutputValues:          make(map[addrs.OutputValue]cty.Value),
+		},
+		&stackstate.AppliedChangeResourceInstanceObject{
+			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+			NewStateSrc: &states.ResourceInstanceObjectSrc{
+				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+					"id":    "2f9f3b84",
+					"value": "hello",
+				}),
+				Status:       states.ObjectReady,
+				Dependencies: make([]addrs.ConfigResource, 0),
+			},
+			ProviderConfigAddr: mustDefaultRootProvider("testing"),
+			Schema:             stacks_testing_provider.TestingResourceSchema,
+		},
+	}
+
+	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+		t.Errorf("wrong changes\n%s", diff)
+	}
+}
+
+func TestApplyEphemeralInputWithDefault(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadMainBundleConfigForTest(t, filepath.Join("with-single-input", "ephemeral-default"))
+
+	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	changesCh := make(chan stackplan.PlannedChange)
+	diagsCh := make(chan tfdiags.Diagnostic)
+	lock := depsfile.NewLocks()
+	lock.SetProvider(
+		addrs.NewDefaultProvider("testing"),
+		providerreqs.MustParseVersion("0.0.0"),
+		providerreqs.MustParseVersionConstraints("=0.0.0"),
+		providerreqs.PreferredHashes([]providerreqs.Hash{}),
+	)
+	req := PlanRequest{
+		Config: cfg,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+
+		ForcePlanTimestamp: &fakePlanTimestamp,
+
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			stackaddrs.InputVariable{Name: "input"}: {
+				Value: cty.StringVal("hello"),
+			},
+		},
+	}
+
+	resp := PlanResponse{
+		PlannedChanges: changesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Plan(ctx, &req, &resp)
+	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
+	if len(planDiags) > 0 {
+		t.Fatalf("expected no diagnostics, got %s", planDiags.ErrWithWarnings())
+	}
+
+	planLoader := stackplan.NewLoader()
+	for _, change := range planChanges {
+		proto, err := change.PlannedChangeProto()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, rawMsg := range proto.Raw {
+			err = planLoader.AddRaw(rawMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	plan, err := planLoader.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	applyReq := ApplyRequest{
+		Config: cfg,
+		Plan:   plan,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			stackaddrs.InputVariable{Name: "input"}: {
+				Value: cty.StringVal("hello"),
+			},
+		},
+	}
+
+	applyChangesCh := make(chan stackstate.AppliedChange)
+	diagsCh = make(chan tfdiags.Diagnostic)
+
+	applyResp := ApplyResponse{
+		AppliedChanges: applyChangesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Apply(ctx, &applyReq, &applyResp)
+	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
+	if len(applyDiags) > 0 {
+		t.Fatalf("expected no diagnostics, got %s", applyDiags.ErrWithWarnings())
+	}
+
+	sort.SliceStable(applyChanges, func(i, j int) bool {
+		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
+	})
+
+	wantChanges := []stackstate.AppliedChange{
+		&stackstate.AppliedChangeComponentInstance{
+			ComponentAddr:         mustAbsComponent("component.self"),
+			ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+			OutputValues:          make(map[addrs.OutputValue]cty.Value),
+		},
+		&stackstate.AppliedChangeResourceInstanceObject{
+			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+			NewStateSrc: &states.ResourceInstanceObjectSrc{
+				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+					"id":    "2f9f3b84",
+					"value": "hello",
+				}),
+				Status:       states.ObjectReady,
+				Dependencies: make([]addrs.ConfigResource, 0),
+			},
+			ProviderConfigAddr: mustDefaultRootProvider("testing"),
+			Schema:             stacks_testing_provider.TestingResourceSchema,
+		},
+	}
+
+	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+		t.Errorf("wrong changes\n%s", diff)
+	}
+}
+
+func TestApply_DependsOnComponentWithNoInstances(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadMainBundleConfigForTest(t, path.Join("with-single-input", "depends-on"))
+
+	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lock := depsfile.NewLocks()
+	lock.SetProvider(
+		addrs.NewDefaultProvider("testing"),
+		providerreqs.MustParseVersion("0.0.0"),
+		providerreqs.MustParseVersionConstraints("=0.0.0"),
+		providerreqs.PreferredHashes([]providerreqs.Hash{}),
+	)
+
+	changesCh := make(chan stackplan.PlannedChange)
+	diagsCh := make(chan tfdiags.Diagnostic)
+	planRequest := PlanRequest{
+		Config: cfg,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks:    *lock,
+		ForcePlanTimestamp: &fakePlanTimestamp,
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			{Name: "input"}: {
+				Value: cty.StringVal("hello, world!"),
+			},
+		},
+	}
+
+	planResponse := PlanResponse{
+		PlannedChanges: changesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Plan(ctx, &planRequest, &planResponse)
+	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
+
+	reportDiagnosticsForTest(t, planDiags)
+	if len(planDiags) != 0 {
+		t.FailNow()
+	}
+
+	planLoader := stackplan.NewLoader()
+	for _, change := range planChanges {
+		proto, err := change.PlannedChangeProto()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, rawMsg := range proto.Raw {
+			err = planLoader.AddRaw(rawMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	plan, err := planLoader.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	applyReq := ApplyRequest{
 		Config: cfg,
@@ -1796,26 +2640,13 @@ func TestApplyWithChangedValues(t *testing.T) {
 
 	go Apply(ctx, &applyReq, &applyResp)
 	_, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
-	if len(applyDiags) != 1 {
-		t.Fatalf("expected exactly one diagnostic, got %s", applyDiags.ErrWithWarnings())
+	reportDiagnosticsForTest(t, applyDiags)
+	if len(applyDiags) != 0 {
+		t.FailNow()
 	}
 
-	// We don't care about the changes here, just that we got the diagnostic
-	// we expected when we messed the plan up earlier.
-
-	gotSeverity, wantSeverity := applyDiags[0].Severity(), tfdiags.Error
-	gotSummary, wantSummary := applyDiags[0].Description().Summary, "Planned input variable value changed"
-	gotDetail, wantDetail := applyDiags[0].Description().Detail, "The planned value for input variable \"input\" has changed between the planning and apply phases for component.self. This is a bug in Terraform - please report it."
-
-	if gotSeverity != wantSeverity {
-		t.Errorf("expected severity %q, got %q", wantSeverity, gotSeverity)
-	}
-	if gotSummary != wantSummary {
-		t.Errorf("expected summary %q, got %q", wantSummary, gotSummary)
-	}
-	if gotDetail != wantDetail {
-		t.Errorf("expected detail %q, got %q", wantDetail, gotDetail)
-	}
+	// don't care about the changes - just want to make sure that depends_on
+	// reference to a component with zero instances doesn't break anything
 }
 
 func collectApplyOutput(changesCh <-chan stackstate.AppliedChange, diagsCh <-chan tfdiags.Diagnostic) ([]stackstate.AppliedChange, tfdiags.Diagnostics) {
