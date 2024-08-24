@@ -16,6 +16,7 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/depsfile"
 	"github.com/hashicorp/terraform/internal/instances"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/promising"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
@@ -91,7 +92,7 @@ func CheckProviderInLockfile(locks depsfile.Locks, providerType *ProviderType, d
 			Severity: hcl.DiagError,
 			Summary:  "Provider missing from lockfile",
 			Detail: fmt.Sprintf(
-				"Provider %q is not in the lockfile. This provider must be in the lockfile to be used in the configuration. Please run `tfstacks provider lock` to update the lockfile and run this operation again with an updated configuration.",
+				"Provider %q is not in the lockfile. This provider must be in the lockfile to be used in the configuration. Please run `tfstacks providers lock` to update the lockfile and run this operation again with an updated configuration.",
 				providerType.Addr(),
 			),
 			Subject: declRange.ToHCL().Ptr(),
@@ -206,6 +207,11 @@ func (p *ProviderConfig) ResolveExpressionReference(ctx context.Context, ref sta
 	}
 
 	return ret, diags
+}
+
+// ExternalFunctions implements ExpressionScope.
+func (p *ProviderConfig) ExternalFunctions(ctx context.Context) (lang.ExternalFuncs, func(), tfdiags.Diagnostics) {
+	return p.main.ProviderFunctions(ctx, p.main.StackConfig(ctx, p.Addr().Stack))
 }
 
 // PlanTimestamp implements ExpressionScope, providing the timestamp at which

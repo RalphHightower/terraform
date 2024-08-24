@@ -4924,8 +4924,8 @@ func TestContext2Apply_provisionerDestroyRemoved(t *testing.T) {
 	}
 
 	state := states.NewState()
-	root := state.RootModule()
-	root.SetResourceInstanceCurrent(
+	foo := state.EnsureModule(mustModuleInstance("module.foo"))
+	foo.SetResourceInstanceCurrent(
 		mustResourceInstanceAddr(`aws_instance.foo["a"]`).Resource,
 		&states.ResourceInstanceObjectSrc{
 			Status:    states.ObjectReady,
@@ -9533,7 +9533,7 @@ func TestContext2Apply_moduleReplaceCycle(t *testing.T) {
 			},
 		})
 
-		changes := &plans.Changes{
+		changes := &plans.ChangesSrc{
 			Resources: []*plans.ResourceInstanceChangeSrc{
 				{
 					Addr: addrs.Resource{

@@ -19,12 +19,14 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
 	"github.com/hashicorp/terraform/internal/instances"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/promising"
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackconfig"
 	"github.com/hashicorp/terraform/internal/stacks/stackconfig/stackconfigtypes"
 	"github.com/hashicorp/terraform/internal/stacks/stackplan"
+	"github.com/hashicorp/terraform/internal/stacks/stackruntime/internal/stackeval/stubs"
 	"github.com/hashicorp/terraform/internal/terraform"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 )
@@ -476,6 +478,7 @@ func (c *ComponentConfig) ExprReferenceValue(ctx context.Context, phase EvalPhas
 	return cty.DynamicVal
 }
 
+// ResolveExpressionReference implements ExpressionScope.
 func (c *ComponentConfig) ResolveExpressionReference(ctx context.Context, ref stackaddrs.Reference) (Referenceable, tfdiags.Diagnostics) {
 	repetition := instances.RepetitionData{}
 	if c.Declaration(ctx).ForEach != nil {
@@ -484,6 +487,11 @@ func (c *ComponentConfig) ResolveExpressionReference(ctx context.Context, ref st
 		repetition.EachValue = cty.DynamicVal
 	}
 	return c.StackConfig(ctx).resolveExpressionReference(ctx, ref, nil, repetition)
+}
+
+// ExternalFunctions implements ExpressionScope.
+func (c *ComponentConfig) ExternalFunctions(ctx context.Context) (lang.ExternalFuncs, func(), tfdiags.Diagnostics) {
+	return c.main.ProviderFunctions(ctx, c.StackConfig(ctx))
 }
 
 // PlanTimestamp implements ExpressionScope, providing the timestamp at which
@@ -532,7 +540,22 @@ func (c *ComponentConfig) checkValid(ctx context.Context, phase EvalPhase) tfdia
 			return diags, nil
 		}
 
+		providerFactories := make(map[addrs.Provider]providers.Factory, len(providerSchemas))
+		for addr := range providerSchemas {
+			providerFactories[addr] = func() (providers.Interface, error) {
+				// Lazily fetch the unconfigured client for the provider
+				// as and when we need it.
+				provider, err := c.main.ProviderType(ctx, addr).UnconfiguredClient(ctx)
+				if err != nil {
+					return nil, err
+				}
+				// this provider should only be used for selected operations
+				return stubs.OfflineProvider(provider), nil
+			}
+		}
+
 		tfCtx, err := terraform.NewContext(&terraform.ContextOpts{
+			Providers:                providerFactories,
 			PreloadedProviderSchemas: providerSchemas,
 			Provisioners:             c.main.availableProvisioners(),
 		})

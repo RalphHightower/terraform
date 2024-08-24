@@ -15,6 +15,7 @@ import (
 	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
 	"github.com/hashicorp/terraform/internal/instances"
+	"github.com/hashicorp/terraform/internal/lang"
 	"github.com/hashicorp/terraform/internal/lang/marks"
 	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/promising"
@@ -535,6 +536,38 @@ func (c *ComponentInstance) CheckModuleTreePlan(ctx context.Context) (*plans.Pla
 				return nil, diags
 			}
 
+			// We're actually going to provide two sets of providers to Core
+			// for Stacks operations.
+			//
+			// First, we provide the basic set of factories here. These are used
+			// by Terraform Core to handle operations that require an
+			// unconfigured provider, such as cross-provider move operations and
+			// provider functions. The provider factories return the shared
+			// unconfigured client that stacks holds for the same reasons. The
+			// factories will lazily request the unconfigured clients here as
+			// they are requested by Terraform.
+			//
+			// Second, we provide provider clients that are already configured
+			// for any operations that require configured clients. This is
+			// because we want to provide the clients built using the provider
+			// configurations from the stack that exist outside of Terraform's
+			// concerns. These are provided below in the `providerClients`
+			// variable.
+
+			providerFactories := make(map[addrs.Provider]providers.Factory, len(providerSchemas))
+			for addr := range providerSchemas {
+				providerFactories[addr] = func() (providers.Interface, error) {
+					// Lazily fetch the unconfigured client for the provider
+					// as and when we need it.
+					provider, err := c.main.ProviderType(ctx, addr).UnconfiguredClient(ctx)
+					if err != nil {
+						return nil, err
+					}
+					// this provider should only be used for selected operations
+					return stubs.OfflineProvider(provider), nil
+				}
+			}
+
 			tfCtx, err := terraform.NewContext(&terraform.ContextOpts{
 				Hooks: []terraform.Hook{
 					&componentInstanceTerraformHook{
@@ -544,6 +577,7 @@ func (c *ComponentInstance) CheckModuleTreePlan(ctx context.Context) (*plans.Pla
 						addr:  c.Addr(),
 					},
 				},
+				Providers:                providerFactories,
 				PreloadedProviderSchemas: providerSchemas,
 				Provisioners:             c.main.availableProvisioners(),
 			})
@@ -780,6 +814,20 @@ func (c *ComponentInstance) ApplyModuleTreePlan(ctx context.Context, plan *plans
 		return noOpResult, diags
 	}
 
+	providerFactories := make(map[addrs.Provider]providers.Factory, len(providerSchemas))
+	for addr := range providerSchemas {
+		providerFactories[addr] = func() (providers.Interface, error) {
+			// Lazily fetch the unconfigured client for the provider
+			// as and when we need it.
+			provider, err := c.main.ProviderType(ctx, addr).UnconfiguredClient(ctx)
+			if err != nil {
+				return nil, err
+			}
+			// this provider should only be used for selected operations
+			return stubs.OfflineProvider(provider), nil
+		}
+	}
+
 	tfHook := &componentInstanceTerraformHook{
 		ctx:   ctx,
 		seq:   seq,
@@ -790,6 +838,7 @@ func (c *ComponentInstance) ApplyModuleTreePlan(ctx context.Context, plan *plans
 		Hooks: []terraform.Hook{
 			tfHook,
 		},
+		Providers:                providerFactories,
 		PreloadedProviderSchemas: providerSchemas,
 		Provisioners:             c.main.availableProvisioners(),
 	})
@@ -1287,6 +1336,11 @@ func (c *ComponentInstance) ResolveExpressionReference(ctx context.Context, ref 
 	return stack.resolveExpressionReference(ctx, ref, nil, c.repetition)
 }
 
+// ExternalFunctions implements ExpressionScope.
+func (c *ComponentInstance) ExternalFunctions(ctx context.Context) (lang.ExternalFuncs, func(), tfdiags.Diagnostics) {
+	return c.main.ProviderFunctions(ctx, c.call.Config(ctx).StackConfig(ctx))
+}
+
 // PlanTimestamp implements ExpressionScope, providing the timestamp at which
 // the current plan is being run.
 func (c *ComponentInstance) PlanTimestamp() time.Time {
@@ -1345,15 +1399,16 @@ func (c *ComponentInstance) PlanChanges(ctx context.Context) ([]stackplan.Planne
 		changes = append(changes, &stackplan.PlannedChangeComponentInstance{
 			Addr: c.Addr(),
 
-			Action:                 action,
-			Mode:                   corePlan.UIMode,
-			PlanApplyable:          corePlan.Applyable,
-			PlanComplete:           corePlan.Complete,
-			RequiredComponents:     c.RequiredComponents(ctx),
-			PlannedInputValues:     corePlan.VariableValues,
-			PlannedInputValueMarks: corePlan.VariableMarks,
-			PlannedOutputValues:    outputVals,
-			PlannedCheckResults:    corePlan.Checks,
+			Action:                         action,
+			Mode:                           corePlan.UIMode,
+			PlanApplyable:                  corePlan.Applyable,
+			PlanComplete:                   corePlan.Complete,
+			RequiredComponents:             c.RequiredComponents(ctx),
+			PlannedInputValues:             corePlan.VariableValues,
+			PlannedInputValueMarks:         corePlan.VariableMarks,
+			PlannedOutputValues:            outputVals,
+			PlannedCheckResults:            corePlan.Checks,
+			PlannedProviderFunctionResults: corePlan.ProviderFunctionResults,
 
 			// We must remember the plan timestamp so that the plantimestamp
 			// function can return a consistent result during a later apply phase.

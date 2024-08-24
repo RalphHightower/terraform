@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/google/go-cmp/cmp/cmpopts"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/zclconf/go-cty-debug/ctydebug"
 	"github.com/zclconf/go-cty/cty"
@@ -35,7 +36,15 @@ import (
 	"github.com/hashicorp/terraform/internal/stacks/stackstate"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
+	"github.com/hashicorp/terraform/version"
 )
+
+var changesCmpOpts = cmp.Options{
+	ctydebug.CmpOptions,
+	cmpCollectionsSet,
+	cmpopts.IgnoreUnexported(addrs.InputVariable{}),
+	cmpopts.IgnoreUnexported(states.ResourceInstanceObjectSrc{}),
+}
 
 func TestApplyWithRemovedResource(t *testing.T) {
 	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1994-09-05T08:50:00Z")
@@ -218,7 +227,7 @@ func TestApplyWithRemovedResource(t *testing.T) {
 		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 	})
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -422,7 +431,7 @@ func TestApplyWithMovedResource(t *testing.T) {
 		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 	})
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -593,7 +602,7 @@ func TestApplyWithSensitivePropagation(t *testing.T) {
 		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 	})
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -761,7 +770,7 @@ func TestApplyWithCheckableObjects(t *testing.T) {
 		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 	})
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 
@@ -887,7 +896,7 @@ func TestApplyWithCheckableObjects(t *testing.T) {
 		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 	})
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -1024,7 +1033,7 @@ func TestApplyWithForcePlanTimestamp(t *testing.T) {
 		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 	})
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -1251,7 +1260,7 @@ func TestApplyWithFailedComponent(t *testing.T) {
 		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 	})
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 
@@ -1361,7 +1370,7 @@ func TestApplyWithFailedProviderLinkedComponent(t *testing.T) {
 		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 	})
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 
@@ -1840,7 +1849,7 @@ func TestApplyWithStateManipulation(t *testing.T) {
 				return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 			})
 
-			if diff := cmp.Diff(tc.changes, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+			if diff := cmp.Diff(tc.changes, applyChanges, changesCmpOpts); diff != "" {
 				t.Errorf("wrong changes\n%s", diff)
 			}
 
@@ -1989,7 +1998,7 @@ func TestApplyWithChangedInputValues(t *testing.T) {
 		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
 	})
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -2145,7 +2154,7 @@ func TestApplyAutomaticInputConversion(t *testing.T) {
 		},
 	}
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -2278,7 +2287,7 @@ func TestApplyEphemeralInput(t *testing.T) {
 		},
 	}
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -2421,7 +2430,7 @@ func TestApplyMissingEphemeralInput(t *testing.T) {
 		},
 	}
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -2547,7 +2556,7 @@ func TestApplyEphemeralInputWithDefault(t *testing.T) {
 		},
 	}
 
-	if diff := cmp.Diff(wantChanges, applyChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
 }
@@ -2647,6 +2656,226 @@ func TestApply_DependsOnComponentWithNoInstances(t *testing.T) {
 
 	// don't care about the changes - just want to make sure that depends_on
 	// reference to a component with zero instances doesn't break anything
+}
+
+func TestApply_WithProviderFunctions(t *testing.T) {
+	ctx := context.Background()
+	cfg := loadMainBundleConfigForTest(t, filepath.Join("with-provider-functions"))
+
+	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lock := depsfile.NewLocks()
+	lock.SetProvider(
+		addrs.NewDefaultProvider("testing"),
+		providerreqs.MustParseVersion("0.0.0"),
+		providerreqs.MustParseVersionConstraints("=0.0.0"),
+		providerreqs.PreferredHashes([]providerreqs.Hash{}),
+	)
+
+	changesCh := make(chan stackplan.PlannedChange)
+	diagsCh := make(chan tfdiags.Diagnostic)
+
+	planRequest := PlanRequest{
+		Config: cfg,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks:    *lock,
+		ForcePlanTimestamp: &fakePlanTimestamp,
+		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
+			{Name: "input"}: {
+				Value: cty.StringVal("hello, world!"),
+			},
+		},
+	}
+
+	planResponse := PlanResponse{
+		PlannedChanges: changesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Plan(ctx, &planRequest, &planResponse)
+	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
+
+	reportDiagnosticsForTest(t, planDiags)
+	if len(planDiags) != 0 {
+		t.FailNow()
+	}
+
+	sort.SliceStable(planChanges, func(i, j int) bool {
+		return plannedChangeSortKey(planChanges[i]) < plannedChangeSortKey(planChanges[j])
+	})
+	wantPlanChanges := []stackplan.PlannedChange{
+		&stackplan.PlannedChangeApplyable{
+			Applyable: true,
+		},
+		&stackplan.PlannedChangeComponentInstance{
+			Addr:               mustAbsComponentInstance("component.self"),
+			PlanApplyable:      true,
+			PlanComplete:       true,
+			Action:             plans.Create,
+			RequiredComponents: collections.NewSet[stackaddrs.AbsComponent](),
+			PlannedInputValues: map[string]plans.DynamicValue{
+				"id":    mustPlanDynamicValueDynamicType(cty.StringVal("2f9f3b84")),
+				"input": mustPlanDynamicValueDynamicType(cty.StringVal("hello, world!")),
+			},
+			PlannedInputValueMarks: map[string][]cty.PathValueMarks{
+				"id":    nil,
+				"input": nil,
+			},
+			PlannedOutputValues: map[string]cty.Value{
+				"value": cty.StringVal("hello, world!"),
+			},
+			PlannedCheckResults: &states.CheckResults{},
+			PlannedProviderFunctionResults: []providers.FunctionHash{
+				{
+					Key:    providerFunctionHashArgs(mustDefaultRootProvider("testing").Provider, "echo", cty.StringVal("hello, world!")),
+					Result: providerFunctionHashResult(cty.StringVal("hello, world!")),
+				},
+			},
+			PlanTimestamp: fakePlanTimestamp,
+		},
+		&stackplan.PlannedChangeResourceInstancePlanned{
+			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+			ChangeSrc: &plans.ResourceInstanceChangeSrc{
+				Addr:         mustAbsResourceInstance("testing_resource.data"),
+				PrevRunAddr:  mustAbsResourceInstance("testing_resource.data"),
+				ProviderAddr: mustDefaultRootProvider("testing"),
+				ChangeSrc: plans.ChangeSrc{
+					Action: plans.Create,
+					Before: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
+						"id":    cty.String,
+						"value": cty.String,
+					}))),
+					After: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
+						"id":    cty.StringVal("2f9f3b84"),
+						"value": cty.StringVal("hello, world!"),
+					})),
+				},
+			},
+			ProviderConfigAddr: mustDefaultRootProvider("testing"),
+			Schema:             stacks_testing_provider.TestingResourceSchema,
+		},
+		&stackplan.PlannedChangeProviderFunctionResults{
+			Results: []providers.FunctionHash{
+				{
+					Key:    providerFunctionHashArgs(mustDefaultRootProvider("testing").Provider, "echo", cty.StringVal("hello, world!")),
+					Result: providerFunctionHashResult(cty.StringVal("hello, world!")),
+				},
+			},
+		},
+		&stackplan.PlannedChangeHeader{
+			TerraformVersion: version.SemVer,
+		},
+		&stackplan.PlannedChangeOutputValue{
+			Addr:     stackaddrs.OutputValue{Name: "value"},
+			Action:   plans.Create,
+			OldValue: mustPlanDynamicValue(cty.NullVal(cty.String)),
+			NewValue: mustPlanDynamicValue(cty.StringVal("hello, world!")),
+		},
+		&stackplan.PlannedChangePlannedTimestamp{
+			PlannedTimestamp: fakePlanTimestamp,
+		},
+		&stackplan.PlannedChangeRootInputValue{
+			Addr:  stackaddrs.InputVariable{Name: "input"},
+			Value: cty.StringVal("hello, world!"),
+		},
+	}
+	if diff := cmp.Diff(wantPlanChanges, planChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
+		t.Errorf("wrong changes\n%s", diff)
+	}
+
+	planLoader := stackplan.NewLoader()
+	for _, change := range planChanges {
+		proto, err := change.PlannedChangeProto()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		for _, rawMsg := range proto.Raw {
+			err = planLoader.AddRaw(rawMsg)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	plan, err := planLoader.Plan()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// just verify the plan is correctly loading the provider function results
+	// as well
+	if len(plan.ProviderFunctionResults) == 0 {
+		t.Errorf("expected provider function results, got none")
+
+		if len(plan.Components.Get(mustAbsComponentInstance("component.self")).PlannedFunctionResults) == 0 {
+			t.Errorf("expected component function results, got none")
+		}
+	}
+
+	applyReq := ApplyRequest{
+		Config: cfg,
+		Plan:   plan,
+		ProviderFactories: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+				return stacks_testing_provider.NewProvider(), nil
+			},
+		},
+		DependencyLocks: *lock,
+	}
+
+	applyChangesCh := make(chan stackstate.AppliedChange)
+	diagsCh = make(chan tfdiags.Diagnostic)
+
+	applyResp := ApplyResponse{
+		AppliedChanges: applyChangesCh,
+		Diagnostics:    diagsCh,
+	}
+
+	go Apply(ctx, &applyReq, &applyResp)
+	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
+	reportDiagnosticsForTest(t, applyDiags)
+	if len(applyDiags) != 0 {
+		t.FailNow()
+	}
+
+	sort.SliceStable(applyChanges, func(i, j int) bool {
+		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
+	})
+
+	wantApplyChanges := []stackstate.AppliedChange{
+		&stackstate.AppliedChangeComponentInstance{
+			ComponentAddr:         mustAbsComponent("component.self"),
+			ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+			OutputValues: map[addrs.OutputValue]cty.Value{
+				{Name: "value"}: cty.StringVal("hello, world!"),
+			},
+		},
+		&stackstate.AppliedChangeResourceInstanceObject{
+			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+			NewStateSrc: &states.ResourceInstanceObjectSrc{
+				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+					"id":    "2f9f3b84",
+					"value": "hello, world!",
+				}),
+				Status:       states.ObjectReady,
+				Dependencies: make([]addrs.ConfigResource, 0),
+			},
+			ProviderConfigAddr: mustDefaultRootProvider("testing"),
+			Schema:             stacks_testing_provider.TestingResourceSchema,
+		},
+	}
+
+	if diff := cmp.Diff(wantApplyChanges, applyChanges, changesCmpOpts); diff != "" {
+		t.Errorf("wrong changes\n%s", diff)
+	}
 }
 
 func collectApplyOutput(changesCh <-chan stackstate.AppliedChange, diagsCh <-chan tfdiags.Diagnostic) ([]stackstate.AppliedChange, tfdiags.Diagnostics) {
