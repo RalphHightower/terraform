@@ -119,6 +119,16 @@ var (
 						End:      hcl.Pos{Line: 10, Column: 39, Byte: 187},
 					},
 				})
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Reference to undeclared provider configuration",
+					Detail:   "There is no provider \"testing\" \"default\" block declared in this stack.",
+					Subject: &hcl.Range{
+						Filename: mainBundleSourceAddrStr("with-single-input/undeclared-provider/undeclared-provider.tfstack.hcl"),
+						Start:    hcl.Pos{Line: 25, Column: 15, Byte: 379},
+						End:      hcl.Pos{Line: 25, Column: 39, Byte: 403},
+					},
+				})
 				return diags
 			},
 		},
@@ -128,7 +138,17 @@ var (
 				diags = diags.Append(&hcl.Diagnostic{
 					Severity: hcl.DiagError,
 					Summary:  "Missing required provider configuration",
-					Detail:   "The root module for component.self requires a provider configuration named \"testing\" for provider \"hashicorp/testing\", which is not assigned in the component's \"providers\" argument.",
+					Detail:   "The root module for component.removed requires a provider configuration named \"testing\" for provider \"hashicorp/testing\", which is not assigned in the block's \"providers\" argument.",
+					Subject: &hcl.Range{
+						Filename: mainBundleSourceAddrStr("with-single-input/missing-provider/missing-provider.tfstack.hcl"),
+						Start:    hcl.Pos{Line: 25, Column: 1, Byte: 337},
+						End:      hcl.Pos{Line: 25, Column: 8, Byte: 344},
+					},
+				})
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Missing required provider configuration",
+					Detail:   "The root module for component.self requires a provider configuration named \"testing\" for provider \"hashicorp/testing\", which is not assigned in the block's \"providers\" argument.",
 					Subject: &hcl.Range{
 						Filename: mainBundleSourceAddrStr("with-single-input/missing-provider/missing-provider.tfstack.hcl"),
 						Start:    hcl.Pos{Line: 14, Column: 1, Byte: 169},
@@ -149,6 +169,16 @@ var (
 						Filename: mainBundleSourceAddrStr("with-single-input/invalid-provider-type/invalid-provider-type.tfstack.hcl"),
 						Start:    hcl.Pos{Line: 22, Column: 15, Byte: 378},
 						End:      hcl.Pos{Line: 22, Column: 39, Byte: 402},
+					},
+				})
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid provider configuration",
+					Detail:   "The provider configuration slot \"testing\" requires a configuration for provider \"registry.terraform.io/hashicorp/testing\", not for provider \"terraform.io/builtin/testing\".",
+					Subject: &hcl.Range{
+						Filename: mainBundleSourceAddrStr("with-single-input/invalid-provider-type/invalid-provider-type.tfstack.hcl"),
+						Start:    hcl.Pos{Line: 37, Column: 15, Byte: 614},
+						End:      hcl.Pos{Line: 37, Column: 39, Byte: 638},
 					},
 				})
 				return diags
@@ -333,15 +363,15 @@ func TestValidate_valid(t *testing.T) {
 					// test the provider aliasing feature. Both providers
 					// support the same set of resources and data sources.
 					addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-						return stacks_testing_provider.NewProvider(), nil
+						return stacks_testing_provider.NewProvider(t), nil
 					},
 					addrs.NewBuiltInProvider("testing"): func() (providers.Interface, error) {
-						return stacks_testing_provider.NewProvider(), nil
+						return stacks_testing_provider.NewProvider(t), nil
 					},
 					// We also support an "other" provider out of the box to
 					// test the provider aliasing feature.
 					addrs.NewDefaultProvider("other"): func() (providers.Interface, error) {
-						return stacks_testing_provider.NewProvider(), nil
+						return stacks_testing_provider.NewProvider(t), nil
 					},
 				},
 				DependencyLocks: *lock,
@@ -389,10 +419,10 @@ func TestValidate_invalid(t *testing.T) {
 					// test the provider aliasing feature. Both providers
 					// support the same set of resources and data sources.
 					addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-						return stacks_testing_provider.NewProvider(), nil
+						return stacks_testing_provider.NewProvider(t), nil
 					},
 					addrs.NewBuiltInProvider("testing"): func() (providers.Interface, error) {
-						return stacks_testing_provider.NewProvider(), nil
+						return stacks_testing_provider.NewProvider(t), nil
 					},
 				},
 				DependencyLocks: *lock,
@@ -464,10 +494,10 @@ func TestValidate_missing_provider_from_lockfile(t *testing.T) {
 			// test the provider aliasing feature. Both providers
 			// support the same set of resources and data sources.
 			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProvider(), nil
+				return stacks_testing_provider.NewProvider(t), nil
 			},
 			addrs.NewBuiltInProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProvider(), nil
+				return stacks_testing_provider.NewProvider(t), nil
 			},
 		},
 		DependencyLocks: *lock,
@@ -502,7 +532,7 @@ func TestValidate_impliedProviderTypes(t *testing.T) {
 			directory: "with-hashicorp-provider",
 			providers: map[addrs.Provider]providers.Factory{
 				addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-					return stacks_testing_provider.NewProvider(), nil
+					return stacks_testing_provider.NewProvider(t), nil
 				},
 			},
 		},
@@ -510,7 +540,7 @@ func TestValidate_impliedProviderTypes(t *testing.T) {
 			directory: "with-non-hashicorp-provider",
 			providers: map[addrs.Provider]providers.Factory{
 				addrs.NewProvider(addrs.DefaultProviderRegistryHost, "other", "testing"): func() (providers.Interface, error) {
-					return stacks_testing_provider.NewProvider(), nil
+					return stacks_testing_provider.NewProvider(t), nil
 				},
 			},
 			wantDiags: func() tfdiags.Diagnostics {

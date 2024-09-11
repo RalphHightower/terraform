@@ -215,6 +215,23 @@ type AppliedChangeComponentInstance struct {
 	ComponentAddr         stackaddrs.AbsComponent
 	ComponentInstanceAddr stackaddrs.AbsComponentInstance
 
+	// Dependencies "remembers" the set of component instances that were
+	// required by the most recent apply of this component instance.
+	//
+	// This will be used by the stacks runtime to determine the order in
+	// which components should be destroyed when the original component block
+	// is no longer available.
+	Dependencies collections.Set[stackaddrs.AbsComponent]
+
+	// Dependents "remembers" the set of component instances that depended on
+	// this component instance at the most recent apply of this component
+	// instance.
+	//
+	// This will be used by the stacks runtime to determine the order in
+	// which components should be destroyed when the original component block
+	// is no longer available.
+	Dependents collections.Set[stackaddrs.AbsComponent]
+
 	// OutputValues "remembers" the output values from the most recent
 	// apply of the component instance. We store this primarily for external
 	// consumption, since the stacks runtime is able to recalculate the
@@ -225,6 +242,12 @@ type AppliedChangeComponentInstance struct {
 	// If any output values are declared as sensitive then they should be
 	// marked as such here using the usual cty marking strategy.
 	OutputValues map[addrs.OutputValue]cty.Value
+
+	// InputVariables "remembers" the input values from the most recent
+	// apply of the component instance. We store this primarily for usage
+	// within the removed blocks in which the input values from the last
+	// applied state are required to destroy the existing resources.
+	InputVariables map[addrs.InputVariable]cty.Value
 }
 
 var _ AppliedChange = (*AppliedChangeComponentInstance)(nil)
@@ -239,7 +262,7 @@ func (ac *AppliedChangeComponentInstance) AppliedChangeProto() (*stacks.AppliedC
 		ComponentInstanceAddr: ac.ComponentInstanceAddr,
 	}
 
-	rawMsg, err := tfstackdata1.ComponentInstanceResultsToTFStackData1(ac.OutputValues)
+	rawMsg, err := tfstackdata1.ComponentInstanceResultsToTFStackData1(ac.Dependencies, ac.Dependents, ac.OutputValues, ac.InputVariables)
 	if err != nil {
 		return nil, fmt.Errorf("encoding raw state for %s: %w", ac.ComponentInstanceAddr, err)
 	}

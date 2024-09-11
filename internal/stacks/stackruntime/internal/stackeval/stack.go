@@ -49,6 +49,7 @@ type Stack struct {
 	stackCalls     map[stackaddrs.StackCall]*StackCall
 	outputValues   map[stackaddrs.OutputValue]*OutputValue
 	components     map[stackaddrs.Component]*Component
+	removed        map[stackaddrs.Component]*Removed
 	providers      map[stackaddrs.ProviderConfigRef]*Provider
 }
 
@@ -321,6 +322,58 @@ func (s *Stack) Component(ctx context.Context, addr stackaddrs.Component) *Compo
 	return s.Components(ctx)[addr]
 }
 
+func (s *Stack) Removeds(ctx context.Context) map[stackaddrs.Component]*Removed {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.removed != nil {
+		return s.removed
+	}
+
+	decls := s.ConfigDeclarations(ctx)
+	ret := make(map[stackaddrs.Component]*Removed, len(decls.Removed))
+	for _, r := range decls.Removed {
+		absAddr := stackaddrs.AbsComponent{
+			Stack: s.Addr(),
+			Item:  r.FromComponent,
+		}
+		ret[absAddr.Item] = newRemoved(s.main, absAddr)
+	}
+	s.removed = ret
+	return ret
+}
+
+func (s *Stack) Removed(ctx context.Context, addr stackaddrs.Component) *Removed {
+	return s.Removeds(ctx)[addr]
+}
+
+// ApplyableComponents returns the combination of removed blocks and declared
+// components for a given component address.
+func (s *Stack) ApplyableComponents(ctx context.Context, addr stackaddrs.Component) (*Component, *Removed) {
+	return s.Component(ctx, addr), s.Removed(ctx, addr)
+}
+
+// KnownComponentInstances returns a set of the component instances that belong
+// to the given component from the current state or plan.
+func (s *Stack) KnownComponentInstances(component stackaddrs.Component, phase EvalPhase) collections.Set[stackaddrs.ComponentInstance] {
+	switch phase {
+	case PlanPhase:
+		return s.main.PlanPrevState().ComponentInstances(stackaddrs.AbsComponent{
+			Stack: s.Addr(),
+			Item:  component,
+		})
+	case ApplyPhase:
+		return s.main.PlanBeingApplied().ComponentInstances(stackaddrs.AbsComponent{
+			Stack: s.Addr(),
+			Item:  component,
+		})
+	default:
+		// We're not executing with an existing state in the other phases, so
+		// we have no known instances.
+		return collections.NewSet[stackaddrs.ComponentInstance]()
+	}
+}
+
 func (s *Stack) ProviderByLocalAddr(ctx context.Context, localAddr stackaddrs.ProviderConfigRef) *Provider {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -443,7 +496,7 @@ func (s *Stack) ResolveExpressionReference(ctx context.Context, ref stackaddrs.R
 }
 
 // ExternalFunctions implements ExpressionScope.
-func (s *Stack) ExternalFunctions(ctx context.Context) (lang.ExternalFuncs, func(), tfdiags.Diagnostics) {
+func (s *Stack) ExternalFunctions(ctx context.Context) (lang.ExternalFuncs, tfdiags.Diagnostics) {
 	return s.main.ProviderFunctions(ctx, s.StackConfig(ctx))
 }
 
@@ -623,6 +676,8 @@ func (s *Stack) PlanChanges(ctx context.Context) ([]stackplan.PlannedChange, tfd
 		return nil, nil
 	}
 
+	var diags tfdiags.Diagnostics
+
 	// For a root stack we'll return a PlannedChange for each of the output
 	// values, so the caller can see how these would change if this plan is
 	// applied.
@@ -631,6 +686,81 @@ func (s *Stack) PlanChanges(ctx context.Context) ([]stackplan.PlannedChange, tfd
 		// None of these situations should be possible if Stack.ResultValue is
 		// correctly implemented.
 		panic(fmt.Sprintf("invalid result from Stack.ResultValue: %#v", resultVal))
+	}
+
+	// We want to check that all of the components we have in state are
+	// targeted by something (either a component or a removed block) in
+	// the configuration.
+	//
+	// The root stack analysis is the best place to do this. We must do this
+	// during the plan (and not during the analysis) because we may have
+	// for-each attributes that need to be expanded before we can determine
+	// if a component is targeted.
+
+	for _, inst := range s.main.PlanPrevState().AllComponentInstances().Elems() {
+
+		if s.main.PlanPrevState().ComponentInstanceResourceInstanceObjects(inst).Len() == 0 {
+			// Then this component instance doesn't have any resource instances
+			// associated with it, so it doesn't matter if it is or isn't
+			// targeted by anything in the configuration.
+			//
+			// Perhaps we should modify the applied state to remove empty
+			// components instead of keeping them around?
+			continue
+		}
+
+		stack := s.main.Stack(ctx, inst.Stack, PlanPhase)
+		if stack == nil {
+			diags = diags.Append(tfdiags.Sourceless(
+				tfdiags.Error,
+				"Unclaimed component instance",
+				fmt.Sprintf("The component instance %s is not claimed by any component or removed block in the configuration. Make sure it is instantiated by a component block, or targeted for removal by a removed block.", inst.String()),
+			))
+			continue
+		}
+
+		component, removed := stack.ApplyableComponents(ctx, inst.Item.Component)
+		if component != nil {
+			insts, unknown := component.Instances(ctx, PlanPhase)
+			if unknown {
+				// We can't determine if the component is targeted or not. This
+				// is okay, as any changes to this component will be deferred
+				// anyway and a follow up plan will then detect the missing
+				// component if it exists.
+				continue
+			}
+
+			if _, exists := insts[inst.Item.Key]; exists {
+				// This component is targeted by a component block, so we won't
+				// add an error.
+				continue
+			}
+		}
+
+		if removed != nil {
+			insts, unknown, _ := removed.Instances(ctx, PlanPhase)
+			if unknown {
+				// We can't determine if the component is targeted or not. This
+				// is okay, as any changes to this component will be deferred
+				// anyway and a follow up plan will then detect the missing
+				// component if it exists.
+				continue
+			}
+
+			if _, exists := insts[inst.Item.Key]; exists {
+				// This component is targeted by a removed block, so we won't
+				// add an error.
+				continue
+			}
+		}
+
+		// Otherwise, we have a component that is not targeted by anything in
+		// the configuration. We should add an error.
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Unclaimed component instance",
+			fmt.Sprintf("The component instance %s is not claimed by any component or removed block in the configuration. Make sure it is instantiated by a component block, or targeted for removal by a removed block.", inst.String()),
+		))
 	}
 
 	var changes []stackplan.PlannedChange
@@ -650,7 +780,6 @@ func (s *Stack) PlanChanges(ctx context.Context) ([]stackplan.PlannedChange, tfd
 			// Any other marks should've been dealt with by our caller before
 			// getting here, since we only know how to preserve the sensitive
 			// marking.
-			var diags tfdiags.Diagnostics
 			diags = diags.Append(fmt.Errorf(
 				"%s%s: unhandled value marks %#v (this is a bug in Terraform)",
 				outputAddr,
@@ -683,14 +812,7 @@ func (s *Stack) PlanChanges(ctx context.Context) ([]stackplan.PlannedChange, tfd
 			NewValueSensitivePaths: sensitivePaths,
 		})
 	}
-	return changes, nil
-}
-
-func (s *Stack) RequiredComponents(ctx context.Context) collections.Set[stackaddrs.AbsComponent] {
-	// The stack itself doesn't refer to anything and so cannot require
-	// components. Its _call_ might, but that's handled over in
-	// [StackCall.RequiredComponents].
-	return collections.NewSet[stackaddrs.AbsComponent]()
+	return changes, diags
 }
 
 // CheckApply implements Applyable.

@@ -113,12 +113,12 @@ func expectDiagnosticsForTest(t *testing.T, actual tfdiags.Diagnostics, expected
 			t.Errorf("diagnostic [%d] has wrong severity: %s (expected %s)", ix, actual[ix].Severity(), expected[ix].severity)
 		}
 
-		if actual[ix].Description().Summary != expected[ix].summary {
-			t.Errorf("diagnostic [%d] has wrong summary: %s (expected %s)", ix, actual[ix].Description().Summary, expected[ix].summary)
+		if diff := cmp.Diff(actual[ix].Description().Summary, expected[ix].summary); len(diff) > 0 {
+			t.Errorf("diagnostic [%d] has wrong summary: %s", ix, diff)
 		}
 
-		if actual[ix].Description().Detail != expected[ix].detail {
-			t.Errorf("diagnostic [%d] has wrong detail: %s (expected %s)", ix, actual[ix].Description().Detail, expected[ix].detail)
+		if diff := cmp.Diff(actual[ix].Description().Detail, expected[ix].detail); len(diff) > 0 {
+			t.Errorf("diagnostic [%d] has wrong detail: %s", ix, diff)
 		}
 	}
 }
@@ -334,6 +334,10 @@ func mustPlanDynamicValueSchema(v cty.Value, block *configschema.Block) plans.Dy
 		panic(err)
 	}
 	return ret
+}
+
+func mustInputVariable(name string) addrs.InputVariable {
+	return addrs.InputVariable{Name: name}
 }
 
 func mustMarshalJSONAttrs(attrs map[string]interface{}) []byte {
