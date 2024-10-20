@@ -398,6 +398,13 @@ func (n *NodeAbstractResourceInstance) planDestroy(ctx EvalContext, currentState
 		return noop, deferred, nil
 	}
 
+	// If we are in a context where we forget instead of destroying, we can
+	// just return the forget change without consulting the provider.
+	if ctx.Forget() {
+		forget, diags := n.planForget(ctx, currentState, deposedKey)
+		return forget, deferred, diags
+	}
+
 	unmarkedPriorVal, _ := currentState.Value.UnmarkDeep()
 
 	// The config and new value are null to signify that this is a destroy
@@ -2455,7 +2462,7 @@ func (n *NodeAbstractResourceInstance) apply(
 	// persisted.
 	eqV := unmarkedBefore.Equals(unmarkedAfter)
 	eq := eqV.IsKnown() && eqV.True()
-	if change.Action == plans.Update && eq && !marksEqual(beforePaths, afterPaths) {
+	if change.Action == plans.Update && eq && !marks.MarksEqual(beforePaths, afterPaths) {
 		// Copy the previous state, changing only the value
 		newState := &states.ResourceInstanceObject{
 			CreateBeforeDestroy: state.CreateBeforeDestroy,

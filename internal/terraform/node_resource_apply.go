@@ -25,6 +25,7 @@ var (
 	_ GraphNodeAttachResourceConfig = (*nodeExpandApplyableResource)(nil)
 	_ graphNodeExpandsInstances     = (*nodeExpandApplyableResource)(nil)
 	_ GraphNodeTargetable           = (*nodeExpandApplyableResource)(nil)
+	_ GraphNodeDynamicExpandable    = (*nodeExpandApplyableResource)(nil)
 )
 
 func (n *nodeExpandApplyableResource) expandsInstances() {
@@ -48,14 +49,25 @@ func (n *nodeExpandApplyableResource) Name() string {
 	return n.NodeAbstractResource.Name() + " (expand)"
 }
 
-func (n *nodeExpandApplyableResource) Execute(globalCtx EvalContext, op walkOperation) tfdiags.Diagnostics {
-	var diags tfdiags.Diagnostics
-	expander := globalCtx.InstanceExpander()
-	moduleInstances := expander.ExpandModule(n.Addr.Module, false)
-	for _, module := range moduleInstances {
-		moduleCtx := evalContextForModuleInstance(globalCtx, module)
-		diags = diags.Append(n.writeResourceState(moduleCtx, n.Addr.Resource.Absolute(module)))
+func (n *nodeExpandApplyableResource) DynamicExpand(ctx EvalContext) (*Graph, tfdiags.Diagnostics) {
+	if n.Addr.Resource.Mode == addrs.EphemeralResourceMode {
+		// We need to expand the ephemeral resources the same as we do during
+		// planning, so we convert this into the plannable node on the fly.
+		// There doesn't seem to be any better way to handle this for now, since
+		// ephemeral resources need everything to happen the same as it would
+		// during planning.
+		return (&nodeExpandPlannableResource{
+			NodeAbstractResource: n.NodeAbstractResource,
+		}).DynamicExpand(ctx)
 	}
 
-	return diags
+	var diags tfdiags.Diagnostics
+	expander := ctx.InstanceExpander()
+	moduleInstances := expander.ExpandModule(n.Addr.Module, false)
+	for _, module := range moduleInstances {
+		moduleCtx := evalContextForModuleInstance(ctx, module)
+		diags = diags.Append(n.recordResourceData(moduleCtx, n.Addr.Resource.Absolute(module)))
+	}
+
+	return nil, diags
 }

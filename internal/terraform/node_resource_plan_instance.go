@@ -76,6 +76,8 @@ func (n *NodePlannableResourceInstance) Execute(ctx EvalContext, op walkOperatio
 		return n.managedResourceExecute(ctx)
 	case addrs.DataResourceMode:
 		return n.dataResourceExecute(ctx)
+	case addrs.EphemeralResourceMode:
+		return n.ephemeralResourceExecute(ctx)
 	default:
 		panic(fmt.Errorf("unsupported resource mode %s", n.Config.Mode))
 	}
@@ -147,6 +149,28 @@ func (n *NodePlannableResourceInstance) dataResourceExecute(ctx EvalContext) (di
 			checkRuleSeverity,
 		)
 		diags = diags.Append(checkDiags)
+	}
+
+	return diags
+}
+
+func (n *NodePlannableResourceInstance) ephemeralResourceExecute(ctx EvalContext) (diags tfdiags.Diagnostics) {
+	deferrals := ctx.Deferrals()
+	// For deferred ephemeral resources, we don't need to do anything here.
+	if deferrals.ShouldDeferResourceInstanceChanges(n.Addr, n.Dependencies) {
+		deferrals.ReportEphemeralResourceInstanceDeferred(n.Addr, providers.DeferredReasonDeferredPrereq)
+		return nil
+	}
+
+	deferred, diags := ephemeralResourceOpen(ctx, ephemeralResourceInput{
+		addr:           n.Addr,
+		config:         n.Config,
+		providerConfig: n.ResolvedProvider,
+	})
+
+	if deferred != nil {
+		// Then this ephemeral resource has been deferred while opening.
+		deferrals.ReportEphemeralResourceInstanceDeferred(n.Addr, deferred.Reason)
 	}
 
 	return diags

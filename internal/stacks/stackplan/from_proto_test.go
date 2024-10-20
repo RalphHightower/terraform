@@ -87,7 +87,14 @@ func TestAddRaw(t *testing.T) {
 				return
 			}
 
-			if diff := cmp.Diff(test.Want, loader.ret, ctydebug.CmpOptions, cmpCollectionsSet[stackaddrs.InputVariable](), cmpCollectionsMap[stackaddrs.AbsComponentInstance, *Component]()); diff != "" {
+			opts := cmp.Options{
+				ctydebug.CmpOptions,
+				cmpCollectionsSet[stackaddrs.InputVariable](),
+				cmpCollectionsSet[stackaddrs.OutputValue](),
+				cmpCollectionsSet[stackaddrs.AbsComponentInstance](),
+				cmpCollectionsMap[stackaddrs.AbsComponentInstance, *Component](),
+			}
+			if diff := cmp.Diff(test.Want, loader.ret, opts...); diff != "" {
 				t.Errorf("AddRaw() mismatch (-want +got):\n%s", diff)
 			}
 		})
@@ -100,7 +107,7 @@ func cmpCollectionsSet[V any]() cmp.Option {
 			return false
 		}
 
-		for _, v := range x.Elems() {
+		for v := range x.All() {
 			if !y.Has(v) {
 				return false
 			}
@@ -116,12 +123,12 @@ func cmpCollectionsMap[K, V any]() cmp.Option {
 			return false
 		}
 
-		for _, entry := range x.Elems() {
-			if !y.HasKey(entry.K) {
+		for key, entry := range x.All() {
+			if !y.HasKey(key) {
 				return false
 			}
 
-			if !cmp.Equal(entry.V, y.Get(entry.K)) {
+			if !cmp.Equal(entry, y.Get(key)) {
 				return false
 			}
 		}

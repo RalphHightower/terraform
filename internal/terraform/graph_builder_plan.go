@@ -137,7 +137,7 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 		&ConfigTransformer{
 			Concrete: b.ConcreteResource,
 			Config:   b.Config,
-			skip:     b.Operation == walkDestroy || b.Operation == walkPlanDestroy,
+			destroy:  b.Operation == walkDestroy || b.Operation == walkPlanDestroy,
 
 			importTargets: b.ImportTargets,
 
@@ -258,6 +258,9 @@ func (b *PlanGraphBuilder) Steps() []GraphTransformer {
 		// Detect when create_before_destroy must be forced on for a particular
 		// node due to dependency edges, to avoid graph cycles during apply.
 		&ForcedCBDTransformer{},
+
+		// Close any ephemeral resource instances.
+		&ephemeralResourceCloseTransformer{skip: b.Operation == walkValidate},
 
 		// Close opened plugin connections
 		&CloseProviderTransformer{},

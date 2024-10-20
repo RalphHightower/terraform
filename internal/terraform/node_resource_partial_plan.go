@@ -62,6 +62,9 @@ func (n *nodeExpandPlannableResource) dynamicExpandPartial(ctx EvalContext, know
 	func() {
 
 		ss := ctx.PrevRunState()
+		if ss == nil {
+			return // No previous state, so nothing to do here.
+		}
 		state := ss.Lock()
 		defer ss.Unlock()
 
@@ -216,7 +219,7 @@ func (n *nodeExpandPlannableResource) expandKnownModule(globalCtx EvalContext, r
 
 	moduleCtx := evalContextForModuleInstance(globalCtx, resAddr.Module)
 
-	moreDiags := n.writeResourceState(moduleCtx, resAddr)
+	moreDiags := n.recordResourceData(moduleCtx, resAddr)
 	diags = diags.Append(moreDiags)
 	if moreDiags.HasErrors() {
 		return nil, nil, nil, diags
@@ -299,8 +302,17 @@ func (n *nodeExpandPlannableResource) knownModuleSubgraph(ctx EvalContext, addr 
 		}),
 
 		DynamicTransformer(func(graph *Graph) error {
+			// Ephemeral resources don't need to be accounted for in this transform,
+			// since they are not in the state.
+			if addr.Resource.Mode == addrs.EphemeralResourceMode {
+				return nil
+			}
+
 			// We'll add nodes for any orphaned resources.
 			rs := state.Resource(addr)
+			if rs == nil {
+				return nil
+			}
 		Instances:
 			for key, inst := range rs.Instances {
 				if inst.Current == nil {

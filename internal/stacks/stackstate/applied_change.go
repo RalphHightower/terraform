@@ -13,15 +13,12 @@ import (
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/collections"
 	"github.com/hashicorp/terraform/internal/configs/configschema"
-	"github.com/hashicorp/terraform/internal/lang/marks"
-	"github.com/hashicorp/terraform/internal/plans"
 	"github.com/hashicorp/terraform/internal/rpcapi/terraform1/stacks"
 	"github.com/hashicorp/terraform/internal/stacks/stackaddrs"
 	"github.com/hashicorp/terraform/internal/stacks/stackstate/statekeys"
 	"github.com/hashicorp/terraform/internal/stacks/stackutils"
 	"github.com/hashicorp/terraform/internal/stacks/tfstackdata1"
 	"github.com/hashicorp/terraform/internal/states"
-	"github.com/hashicorp/terraform/internal/tfdiags"
 )
 
 // AppliedChange represents a single isolated change, emitted as
@@ -159,24 +156,10 @@ func (ac *AppliedChangeResourceInstanceObject) protosForObject() ([]*stacks.Appl
 		return nil, nil, fmt.Errorf("cannot decode new state for %s in preparation for saving it: %w", addr, err)
 	}
 
-	// Separate out sensitive marks from the decoded value so we can re-serialize it
-	// with MessagePack. Sensitive paths get encoded separately in the final message.
-	unmarkedValue, markses := obj.Value.UnmarkDeepWithPaths()
-	sensitivePaths, otherMarkses := marks.PathsWithMark(markses, marks.Sensitive)
-	if len(otherMarkses) != 0 {
-		// Any other marks should've been dealt with by our caller before
-		// getting here, since we only know how to preserve the sensitive
-		// marking.
-		return nil, nil, fmt.Errorf(
-			"%s: unhandled value marks %#v (this is a bug in Terraform)",
-			tfdiags.FormatCtyPath(otherMarkses[0].Path), otherMarkses[0].Marks,
-		)
-	}
-	encValue, err := plans.NewDynamicValue(unmarkedValue, ty)
+	protoValue, err := stacks.ToDynamicValue(obj.Value, ty)
 	if err != nil {
 		return nil, nil, fmt.Errorf("cannot encode new state for %s in preparation for saving it: %w", addr, err)
 	}
-	protoValue := stacks.NewDynamicValue(encValue, sensitivePaths)
 
 	descs = append(descs, &stacks.AppliedChange_ChangeDescription{
 		Key: objKeyRaw,
@@ -203,6 +186,39 @@ func (ac *AppliedChangeResourceInstanceObject) protosForObject() ([]*stacks.Appl
 	})
 
 	return descs, raws, nil
+}
+
+// AppliedChangeComponentInstanceRemoved is the equivalent of
+// AppliedChangeComponentInstance but it represents the component instance
+// being removed from state instead of created or updated.
+type AppliedChangeComponentInstanceRemoved struct {
+	ComponentAddr         stackaddrs.AbsComponent
+	ComponentInstanceAddr stackaddrs.AbsComponentInstance
+}
+
+var _ AppliedChange = (*AppliedChangeComponentInstanceRemoved)(nil)
+
+// AppliedChangeProto implements AppliedChange.
+func (ac *AppliedChangeComponentInstanceRemoved) AppliedChangeProto() (*stacks.AppliedChange, error) {
+	stateKey := statekeys.String(statekeys.ComponentInstance{
+		ComponentInstanceAddr: ac.ComponentInstanceAddr,
+	})
+	return &stacks.AppliedChange{
+		Raw: []*stacks.AppliedChange_RawChange{
+			{
+				Key:   stateKey,
+				Value: nil,
+			},
+		},
+		Descriptions: []*stacks.AppliedChange_ChangeDescription{
+			{
+				Key: stateKey,
+				Description: &stacks.AppliedChange_ChangeDescription_Deleted{
+					Deleted: &stacks.AppliedChange_Nothing{},
+				},
+			},
+		},
+	}, nil
 }
 
 // AppliedChangeComponentInstance announces the result of applying changes to
@@ -254,59 +270,209 @@ var _ AppliedChange = (*AppliedChangeComponentInstance)(nil)
 
 // AppliedChangeProto implements AppliedChange.
 func (ac *AppliedChangeComponentInstance) AppliedChangeProto() (*stacks.AppliedChange, error) {
-	ret := &stacks.AppliedChange{
-		Raw:          make([]*stacks.AppliedChange_RawChange, 0, 1),
-		Descriptions: make([]*stacks.AppliedChange_ChangeDescription, 0, 1),
-	}
-	stateKey := statekeys.ComponentInstance{
+	stateKey := statekeys.String(statekeys.ComponentInstance{
 		ComponentInstanceAddr: ac.ComponentInstanceAddr,
-	}
-
-	rawMsg, err := tfstackdata1.ComponentInstanceResultsToTFStackData1(ac.Dependencies, ac.Dependents, ac.OutputValues, ac.InputVariables)
-	if err != nil {
-		return nil, fmt.Errorf("encoding raw state for %s: %w", ac.ComponentInstanceAddr, err)
-	}
-	var raw anypb.Any
-	err = anypb.MarshalFrom(&raw, rawMsg, proto.MarshalOptions{})
-	if err != nil {
-		return nil, fmt.Errorf("encoding raw state for %s: %w", ac.ComponentInstanceAddr, err)
-	}
+	})
 
 	outputDescs := make(map[string]*stacks.DynamicValue, len(ac.OutputValues))
 	for addr, val := range ac.OutputValues {
-		unmarkedValue, markses := val.UnmarkDeepWithPaths()
-		sensitivePaths, otherMarkses := marks.PathsWithMark(markses, marks.Sensitive)
-		if len(otherMarkses) != 0 {
-			// Any other marks should've been dealt with by our caller before
-			// getting here, since we only know how to preserve the sensitive
-			// marking.
-			return nil, fmt.Errorf(
-				"%s: unhandled value marks %#v (this is a bug in Terraform)",
-				tfdiags.FormatCtyPath(otherMarkses[0].Path), otherMarkses[0].Marks,
-			)
-		}
-		encValue, err := plans.NewDynamicValue(unmarkedValue, cty.DynamicPseudoType)
+		protoValue, err := stacks.ToDynamicValue(val, cty.DynamicPseudoType)
 		if err != nil {
 			return nil, fmt.Errorf("encoding new state for %s in %s in preparation for saving it: %w", addr, ac.ComponentInstanceAddr, err)
 		}
-		protoValue := stacks.NewDynamicValue(encValue, sensitivePaths)
 		outputDescs[addr.Name] = protoValue
 	}
 
-	ret.Raw = append(ret.Raw, &stacks.AppliedChange_RawChange{
-		Key:   statekeys.String(stateKey),
-		Value: &raw,
-	})
-	ret.Descriptions = append(ret.Descriptions, &stacks.AppliedChange_ChangeDescription{
-		Key: statekeys.String(stateKey),
-		Description: &stacks.AppliedChange_ChangeDescription_ComponentInstance{
-			ComponentInstance: &stacks.AppliedChange_ComponentInstance{
-				ComponentAddr:         ac.ComponentAddr.String(),
-				ComponentInstanceAddr: ac.ComponentInstanceAddr.String(),
+	inputDescs := make(map[string]*stacks.DynamicValue, len(ac.InputVariables))
+	for addr, val := range ac.InputVariables {
+		protoValue, err := stacks.ToDynamicValue(val, cty.DynamicPseudoType)
+		if err != nil {
+			return nil, fmt.Errorf("encoding new state for %s in %s in preparation for saving it: %w", addr, ac.ComponentInstanceAddr, err)
+		}
+		inputDescs[addr.Name] = protoValue
+	}
+
+	var raw anypb.Any
+	if err := anypb.MarshalFrom(&raw, &tfstackdata1.StateComponentInstanceV1{
+		OutputValues: func() map[string]*tfstackdata1.DynamicValue {
+			outputs := make(map[string]*tfstackdata1.DynamicValue, len(outputDescs))
+			for name, value := range outputDescs {
+				outputs[name] = tfstackdata1.Terraform1ToStackDataDynamicValue(value)
+			}
+			return outputs
+		}(),
+		InputVariables: func() map[string]*tfstackdata1.DynamicValue {
+			inputs := make(map[string]*tfstackdata1.DynamicValue, len(inputDescs))
+			for name, value := range inputDescs {
+				inputs[name] = tfstackdata1.Terraform1ToStackDataDynamicValue(value)
+			}
+			return inputs
+		}(),
+		DependencyAddrs: func() []string {
+			var dependencies []string
+			for dependency := range ac.Dependencies.All() {
+				dependencies = append(dependencies, dependency.String())
+			}
+			return dependencies
+		}(),
+		DependentAddrs: func() []string {
+			var dependents []string
+			for dependent := range ac.Dependents.All() {
+				dependents = append(dependents, dependent.String())
+			}
+			return dependents
+		}(),
+	}, proto.MarshalOptions{}); err != nil {
+		return nil, fmt.Errorf("encoding raw state for %s: %w", ac.ComponentInstanceAddr, err)
+	}
+
+	return &stacks.AppliedChange{
+		Raw: []*stacks.AppliedChange_RawChange{
+			{
+				Key:   stateKey,
+				Value: &raw,
 			},
 		},
+		Descriptions: []*stacks.AppliedChange_ChangeDescription{
+			{
+				Key: stateKey,
+				Description: &stacks.AppliedChange_ChangeDescription_ComponentInstance{
+					ComponentInstance: &stacks.AppliedChange_ComponentInstance{
+						ComponentAddr:         ac.ComponentAddr.String(),
+						ComponentInstanceAddr: ac.ComponentInstanceAddr.String(),
+						OutputValues:          outputDescs,
+					},
+				},
+			},
+		},
+	}, nil
+}
+
+type AppliedChangeInputVariable struct {
+	Addr  stackaddrs.InputVariable
+	Value cty.Value
+}
+
+var _ AppliedChange = (*AppliedChangeInputVariable)(nil)
+
+func (ac *AppliedChangeInputVariable) AppliedChangeProto() (*stacks.AppliedChange, error) {
+	key := statekeys.String(statekeys.Variable{
+		VariableAddr: ac.Addr,
 	})
-	return ret, nil
+
+	if ac.Value == cty.NilVal {
+		// Then we're deleting this input variable from the state.
+		return &stacks.AppliedChange{
+			Raw: []*stacks.AppliedChange_RawChange{
+				{
+					Key:   key,
+					Value: nil,
+				},
+			},
+			Descriptions: []*stacks.AppliedChange_ChangeDescription{
+				{
+					Key: key,
+					Description: &stacks.AppliedChange_ChangeDescription_Deleted{
+						Deleted: &stacks.AppliedChange_Nothing{},
+					},
+				},
+			},
+		}, nil
+	}
+
+	var raw anypb.Any
+	description := &stacks.AppliedChange_InputVariable{
+		Name: ac.Addr.Name,
+	}
+
+	value, err := stacks.ToDynamicValue(ac.Value, cty.DynamicPseudoType)
+	if err != nil {
+		return nil, fmt.Errorf("encoding new state for %s in preparation for saving it: %w", ac.Addr, err)
+	}
+	description.NewValue = value
+	if err := anypb.MarshalFrom(&raw, tfstackdata1.Terraform1ToStackDataDynamicValue(value), proto.MarshalOptions{}); err != nil {
+		return nil, fmt.Errorf("encoding raw state for %s: %w", ac.Addr, err)
+	}
+
+	return &stacks.AppliedChange{
+		Raw: []*stacks.AppliedChange_RawChange{
+			{
+				Key:   key,
+				Value: &raw,
+			},
+		},
+		Descriptions: []*stacks.AppliedChange_ChangeDescription{
+			{
+				Key: key,
+				Description: &stacks.AppliedChange_ChangeDescription_InputVariable{
+					InputVariable: description,
+				},
+			},
+		},
+	}, nil
+}
+
+type AppliedChangeOutputValue struct {
+	Addr  stackaddrs.OutputValue
+	Value cty.Value
+}
+
+var _ AppliedChange = (*AppliedChangeOutputValue)(nil)
+
+func (ac *AppliedChangeOutputValue) AppliedChangeProto() (*stacks.AppliedChange, error) {
+	key := statekeys.String(statekeys.Output{
+		OutputAddr: ac.Addr,
+	})
+
+	if ac.Value == cty.NilVal {
+		// Then we're deleting this output value from the state.
+		return &stacks.AppliedChange{
+			Raw: []*stacks.AppliedChange_RawChange{
+				{
+					Key:   key,
+					Value: nil,
+				},
+			},
+			Descriptions: []*stacks.AppliedChange_ChangeDescription{
+				{
+					Key: key,
+					Description: &stacks.AppliedChange_ChangeDescription_Deleted{
+						Deleted: &stacks.AppliedChange_Nothing{},
+					},
+				},
+			},
+		}, nil
+	}
+
+	value, err := stacks.ToDynamicValue(ac.Value, cty.DynamicPseudoType)
+	if err != nil {
+		return nil, fmt.Errorf("encoding new state for %s in preparation for saving it: %w", ac.Addr, err)
+	}
+
+	var raw anypb.Any
+	if err := anypb.MarshalFrom(&raw, tfstackdata1.Terraform1ToStackDataDynamicValue(value), proto.MarshalOptions{}); err != nil {
+		return nil, fmt.Errorf("encoding raw state for %s: %w", ac.Addr, err)
+	}
+
+	return &stacks.AppliedChange{
+		Raw: []*stacks.AppliedChange_RawChange{
+			{
+				Key:   key,
+				Value: &raw,
+			},
+		},
+		Descriptions: []*stacks.AppliedChange_ChangeDescription{
+			{
+				Key: key,
+				Description: &stacks.AppliedChange_ChangeDescription_OutputValue{
+					OutputValue: &stacks.AppliedChange_OutputValue{
+						Name:     ac.Addr.Name,
+						NewValue: value,
+					},
+				},
+			},
+		},
+	}, nil
 }
 
 type AppliedChangeDiscardKeys struct {
@@ -322,13 +488,13 @@ func (ac *AppliedChangeDiscardKeys) AppliedChangeProto() (*stacks.AppliedChange,
 		Raw:          make([]*stacks.AppliedChange_RawChange, 0, ac.DiscardRawKeys.Len()),
 		Descriptions: make([]*stacks.AppliedChange_ChangeDescription, 0, ac.DiscardDescKeys.Len()),
 	}
-	for _, key := range ac.DiscardRawKeys.Elems() {
+	for key := range ac.DiscardRawKeys.All() {
 		ret.Raw = append(ret.Raw, &stacks.AppliedChange_RawChange{
 			Key:   statekeys.String(key),
 			Value: nil, // nil represents deletion
 		})
 	}
-	for _, key := range ac.DiscardDescKeys.Elems() {
+	for key := range ac.DiscardDescKeys.All() {
 		ret.Descriptions = append(ret.Descriptions, &stacks.AppliedChange_ChangeDescription{
 			Key:         statekeys.String(key),
 			Description: &stacks.AppliedChange_ChangeDescription_Deleted{

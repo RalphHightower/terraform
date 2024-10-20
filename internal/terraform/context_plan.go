@@ -131,6 +131,10 @@ type PlanOpts struct {
 	// This is here only to allow producing fixed results for tests. Don't
 	// use it for main code.
 	ForcePlanTimestamp *time.Time
+
+	// Forget if set to true will cause the plan to forget all resources. This is
+	// only allowd in the context of a destroy plan.
+	Forget bool
 }
 
 // Plan generates an execution plan by comparing the given configuration
@@ -183,6 +187,9 @@ func (c *Context) PlanAndEval(config *configs.Config, prevRunState *states.State
 
 	moreDiags := c.checkConfigDependencies(config)
 	diags = diags.Append(moreDiags)
+	moreDiags = c.checkStateDependencies(prevRunState)
+	diags = diags.Append(moreDiags)
+
 	// If required dependencies are not available then we'll bail early since
 	// otherwise we're likely to just see a bunch of other errors related to
 	// incompatibilities, which could be overwhelming for the user.
@@ -227,6 +234,14 @@ func (c *Context) PlanAndEval(config *configs.Config, prevRunState *states.State
 			tfdiags.Error,
 			"Unsupported plan mode",
 			"Forcing resource instance replacement (with -replace=...) is allowed only in normal planning mode.",
+		))
+		return nil, nil, diags
+	}
+	if opts.Forget && opts.Mode != plans.DestroyMode {
+		diags = diags.Append(tfdiags.Sourceless(
+			tfdiags.Error,
+			"Unsupported plan mode",
+			"Forgetting all resources is only allowed in the context of a destroy plan. This is a bug in Terraform, please report it.",
 		))
 		return nil, nil, diags
 	}
@@ -366,6 +381,7 @@ func (c *Context) checkApplyGraph(plan *plans.Plan, config *configs.Config, opts
 		return nil
 	}
 	log.Println("[DEBUG] building apply graph to check for errors")
+
 	_, _, diags := c.applyGraph(plan, config, opts.ApplyOpts(), true)
 	return diags
 }
@@ -711,6 +727,7 @@ func (c *Context) planWalk(config *configs.Config, prevRunState *states.State, o
 		Overrides:                  opts.Overrides,
 		PlanTimeTimestamp:          timestamp,
 		ProviderFuncResults:        providerFuncResults,
+		Forget:                     opts.Forget,
 	})
 	diags = diags.Append(walker.NonFatalDiagnostics)
 	diags = diags.Append(walkDiags)

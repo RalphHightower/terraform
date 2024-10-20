@@ -27,6 +27,7 @@ import (
 	"github.com/hashicorp/terraform/internal/providers"
 	"github.com/hashicorp/terraform/internal/provisioners"
 	"github.com/hashicorp/terraform/internal/refactoring"
+	"github.com/hashicorp/terraform/internal/resources/ephemeral"
 	"github.com/hashicorp/terraform/internal/states"
 	"github.com/hashicorp/terraform/internal/tfdiags"
 	"github.com/hashicorp/terraform/version"
@@ -68,23 +69,28 @@ type BuiltinEvalContext struct {
 	// DeferralsValue is the object returned by [BuiltinEvalContext.Deferrals].
 	DeferralsValue *deferring.Deferred
 
-	Hooks                 []Hook
-	InputValue            UIInput
-	ProviderCache         map[string]providers.Interface
-	ProviderFuncCache     map[string]providers.Interface
-	ProviderFuncResults   *providers.FunctionResults
-	ProviderInputConfig   map[string]map[string]cty.Value
-	ProviderLock          *sync.Mutex
-	ProvisionerCache      map[string]provisioners.Interface
-	ProvisionerLock       *sync.Mutex
-	ChangesValue          *plans.ChangesSync
-	StateValue            *states.SyncState
-	ChecksValue           *checks.State
-	RefreshStateValue     *states.SyncState
-	PrevRunStateValue     *states.SyncState
-	InstanceExpanderValue *instances.Expander
-	MoveResultsValue      refactoring.MoveResults
-	OverrideValues        *mocking.Overrides
+	// forget if set to true will cause the plan to forget all resources. This is
+	// only allowd in the context of a destroy plan.
+	forget bool
+
+	Hooks                   []Hook
+	InputValue              UIInput
+	ProviderCache           map[string]providers.Interface
+	ProviderFuncCache       map[string]providers.Interface
+	ProviderFuncResults     *providers.FunctionResults
+	ProviderInputConfig     map[string]map[string]cty.Value
+	ProviderLock            *sync.Mutex
+	ProvisionerCache        map[string]provisioners.Interface
+	ProvisionerLock         *sync.Mutex
+	ChangesValue            *plans.ChangesSync
+	StateValue              *states.SyncState
+	ChecksValue             *checks.State
+	EphemeralResourcesValue *ephemeral.Resources
+	RefreshStateValue       *states.SyncState
+	PrevRunStateValue       *states.SyncState
+	InstanceExpanderValue   *instances.Expander
+	MoveResultsValue        refactoring.MoveResults
+	OverrideValues          *mocking.Overrides
 }
 
 // BuiltinEvalContext implements EvalContext
@@ -96,13 +102,13 @@ func (ctx *BuiltinEvalContext) withScope(scope evalContextScope) EvalContext {
 	return &newCtx
 }
 
-func (ctx *BuiltinEvalContext) Stopped() <-chan struct{} {
+func (ctx *BuiltinEvalContext) StopCtx() context.Context {
 	// This can happen during tests. During tests, we just block forever.
 	if ctx.StopContext == nil {
-		return nil
+		return context.TODO()
 	}
 
-	return ctx.StopContext.Done()
+	return ctx.StopContext
 }
 
 func (ctx *BuiltinEvalContext) Hook(fn func(Hook) (HookAction, error)) error {
@@ -354,7 +360,7 @@ func (ctx *BuiltinEvalContext) EvaluateReplaceTriggeredBy(expr hcl.Expression, r
 	}
 
 	// Do some validation to make sure we are expecting a change at all
-	cfg := ctx.Evaluator.Config.Descendent(ctx.Path().Module())
+	cfg := ctx.Evaluator.Config.Descendant(ctx.Path().Module())
 	resCfg := cfg.Module.ResourceByAddr(resourceAddr)
 	if resCfg == nil {
 		diags = diags.Append(&hcl.Diagnostic{
@@ -435,7 +441,7 @@ func (ctx *BuiltinEvalContext) EvaluationScope(self addrs.Referenceable, source 
 		// package itself works. The nil check here is for robustness in
 		// incompletely-mocked testing situations; mc should never be nil in
 		// real situations.
-		if mc := ctx.Evaluator.Config.DescendentForInstance(scope.Addr); mc != nil {
+		if mc := ctx.Evaluator.Config.DescendantForInstance(scope.Addr); mc != nil {
 			evalScope.SetActiveExperiments(mc.Module.ActiveExperiments)
 		}
 		return evalScope
@@ -451,7 +457,7 @@ func (ctx *BuiltinEvalContext) EvaluationScope(self addrs.Referenceable, source 
 			Operation:      ctx.Evaluator.Operation,
 		}
 		evalScope := ctx.Evaluator.Scope(data, self, source, ctx.evaluationExternalFunctions())
-		if mc := ctx.Evaluator.Config.Descendent(scope.Addr.Module()); mc != nil {
+		if mc := ctx.Evaluator.Config.Descendant(scope.Addr.Module()); mc != nil {
 			evalScope.SetActiveExperiments(mc.Module.ActiveExperiments)
 		}
 		return evalScope
@@ -473,7 +479,7 @@ func (ctx *BuiltinEvalContext) evaluationExternalFunctions() lang.ExternalFuncs 
 	// by the module author.
 	ret := lang.ExternalFuncs{}
 
-	cfg := ctx.Evaluator.Config.Descendent(ctx.scope.evalContextScopeModule())
+	cfg := ctx.Evaluator.Config.Descendant(ctx.scope.evalContextScopeModule())
 	if cfg == nil {
 		// It's weird to not have a configuration by this point, but we'll
 		// tolerate it for robustness and just return no functions at all.
@@ -552,7 +558,7 @@ func (ctx *BuiltinEvalContext) LanguageExperimentActive(experiment experiments.E
 		// is module-scoped.
 		return false
 	}
-	cfg := ctx.Evaluator.Config.Descendent(scope.evalContextScopeModule())
+	cfg := ctx.Evaluator.Config.Descendant(scope.evalContextScopeModule())
 	if cfg == nil {
 		return false
 	}
@@ -597,4 +603,12 @@ func (ctx *BuiltinEvalContext) MoveResults() refactoring.MoveResults {
 
 func (ctx *BuiltinEvalContext) Overrides() *mocking.Overrides {
 	return ctx.OverrideValues
+}
+
+func (ctx *BuiltinEvalContext) Forget() bool {
+	return ctx.forget
+}
+
+func (ctx *BuiltinEvalContext) EphemeralResources() *ephemeral.Resources {
+	return ctx.EphemeralResourcesValue
 }

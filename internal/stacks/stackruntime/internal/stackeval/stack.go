@@ -479,6 +479,10 @@ func (s *Stack) OutputValues(ctx context.Context) map[stackaddrs.OutputValue]*Ou
 	return ret
 }
 
+func (s *Stack) OutputValue(ctx context.Context, addr stackaddrs.OutputValue) *OutputValue {
+	return s.OutputValues(ctx)[addr]
+}
+
 func (s *Stack) ResultValue(ctx context.Context, phase EvalPhase) cty.Value {
 	ovs := s.OutputValues(ctx)
 	elems := make(map[string]cty.Value, len(ovs))
@@ -678,16 +682,6 @@ func (s *Stack) PlanChanges(ctx context.Context) ([]stackplan.PlannedChange, tfd
 
 	var diags tfdiags.Diagnostics
 
-	// For a root stack we'll return a PlannedChange for each of the output
-	// values, so the caller can see how these would change if this plan is
-	// applied.
-	resultVal := s.ResultValue(ctx, PlanPhase)
-	if !resultVal.Type().IsObjectType() || resultVal.IsNull() || !resultVal.IsKnown() {
-		// None of these situations should be possible if Stack.ResultValue is
-		// correctly implemented.
-		panic(fmt.Sprintf("invalid result from Stack.ResultValue: %#v", resultVal))
-	}
-
 	// We want to check that all of the components we have in state are
 	// targeted by something (either a component or a removed block) in
 	// the configuration.
@@ -697,20 +691,26 @@ func (s *Stack) PlanChanges(ctx context.Context) ([]stackplan.PlannedChange, tfd
 	// for-each attributes that need to be expanded before we can determine
 	// if a component is targeted.
 
-	for _, inst := range s.main.PlanPrevState().AllComponentInstances().Elems() {
+	var changes []stackplan.PlannedChange
+	for inst := range s.main.PlanPrevState().AllComponentInstances().All() {
 
-		if s.main.PlanPrevState().ComponentInstanceResourceInstanceObjects(inst).Len() == 0 {
-			// Then this component instance doesn't have any resource instances
-			// associated with it, so it doesn't matter if it is or isn't
-			// targeted by anything in the configuration.
-			//
-			// Perhaps we should modify the applied state to remove empty
-			// components instead of keeping them around?
-			continue
-		}
+		// We track here whether this component instance has any associated
+		// resources. If this component is empty, and not referenced in the
+		// configuration, then we won't return an error. Instead, we'll just
+		// mark this as to-be deleted. There could have been some error
+		// marking the state previously, but whatever it is we can just fix
+		// this so why bother the user with it.
+		empty := s.main.PlanPrevState().ComponentInstanceResourceInstanceObjects(inst).Len() == 0
 
 		stack := s.main.Stack(ctx, inst.Stack, PlanPhase)
 		if stack == nil {
+			if empty {
+				changes = append(changes, &stackplan.PlannedChangeComponentInstanceRemoved{
+					Addr: inst,
+				})
+				continue
+			}
+
 			diags = diags.Append(tfdiags.Sourceless(
 				tfdiags.Error,
 				"Unclaimed component instance",
@@ -755,7 +755,17 @@ func (s *Stack) PlanChanges(ctx context.Context) ([]stackplan.PlannedChange, tfd
 		}
 
 		// Otherwise, we have a component that is not targeted by anything in
-		// the configuration. We should add an error.
+		// the configuration.
+
+		if empty {
+			// It's empty, so we can just remove it.
+			changes = append(changes, &stackplan.PlannedChangeComponentInstanceRemoved{
+				Addr: inst,
+			})
+			continue
+		}
+
+		// Otherwise, it's an error.
 		diags = diags.Append(tfdiags.Sourceless(
 			tfdiags.Error,
 			"Unclaimed component instance",
@@ -763,63 +773,86 @@ func (s *Stack) PlanChanges(ctx context.Context) ([]stackplan.PlannedChange, tfd
 		))
 	}
 
-	var changes []stackplan.PlannedChange
-	for it := resultVal.ElementIterator(); it.Next(); {
-		k, v := it.Element()
-		outputAddr := stackaddrs.OutputValue{Name: k.AsString()}
+	// Finally, we'll look at the input and output values we have in state
+	// and any that do not appear in the configuration we'll mark as deleted.
 
-		// TODO: For now we just assume that all values are being created.
-		// Once we have a prior state we should compare with that to
-		// produce accurate change actions. Also, once outputs are stored in
-		// state, we should update the definition of Applyable for a stack to
-		// reflect updates to outputs making a stack "applyable".
-
-		v, markses := v.UnmarkDeepWithPaths()
-		sensitivePaths, otherMarkses := marks.PathsWithMark(markses, marks.Sensitive)
-		if len(otherMarkses) != 0 {
-			// Any other marks should've been dealt with by our caller before
-			// getting here, since we only know how to preserve the sensitive
-			// marking.
-			diags = diags.Append(fmt.Errorf(
-				"%s%s: unhandled value marks %#v (this is a bug in Terraform)",
-				outputAddr,
-				tfdiags.FormatCtyPath(otherMarkses[0].Path),
-				otherMarkses[0].Marks,
-			))
-			return nil, diags
-		}
-		dv, err := plans.NewDynamicValue(v, v.Type())
-		if err != nil {
-			// Should not be possible since we generated the value internally;
-			// suggests that there's a bug elsewhere in this package.
-			panic(fmt.Sprintf("%s has unencodable value: %s", outputAddr, err))
-		}
-		oldDV, err := plans.NewDynamicValue(cty.NullVal(cty.DynamicPseudoType), cty.DynamicPseudoType)
-		if err != nil {
-			// Should _definitely_ not be possible since the value is written
-			// directly above and should always be encodable.
-			panic(fmt.Sprintf("unencodable value: %s", err))
+	for addr, value := range s.main.PlanPrevState().RootOutputValues() {
+		if s.OutputValue(ctx, addr) != nil {
+			// Then this output value is in the configuration, and will be
+			// processed independently.
+			continue
 		}
 
+		// Otherwise, it's been removed from the configuration.
 		changes = append(changes, &stackplan.PlannedChangeOutputValue{
-			Addr:   outputAddr,
-			Action: plans.Create,
-
-			OldValue:               oldDV,
-			OldValueSensitivePaths: nil,
-
-			NewValue:               dv,
-			NewValueSensitivePaths: sensitivePaths,
+			Addr:   addr,
+			Action: plans.Delete,
+			Before: value,
+			After:  cty.NullVal(cty.DynamicPseudoType),
 		})
 	}
+
+	// Finally, we'll look at the input variables we have in state and delete
+	// any that don't appear in the configuration any more.
+
+	for addr, variable := range s.main.PlanPrevState().RootInputVariables() {
+		if s.InputVariable(ctx, addr) != nil {
+			// Then this input variable is in the configuration, and will
+			// be processed independently.
+			continue
+		}
+
+		// Otherwise, we'll add a delete notification for this root input
+		// variable.
+		changes = append(changes, &stackplan.PlannedChangeRootInputValue{
+			Addr:   addr,
+			Action: plans.Delete,
+			Before: variable,
+			After:  cty.NullVal(cty.DynamicPseudoType),
+		})
+	}
+
 	return changes, diags
 }
 
 // CheckApply implements Applyable.
 func (s *Stack) CheckApply(ctx context.Context) ([]stackstate.AppliedChange, tfdiags.Diagnostics) {
-	// TODO: We should emit an AppliedChange for each output value,
-	// reporting its final value.
-	return nil, nil
+	if !s.IsRoot() {
+		return nil, nil
+	}
+
+	var diags tfdiags.Diagnostics
+	var changes []stackstate.AppliedChange
+
+	// We're also just going to quickly emit any cleanup . These remaining
+	// values are basically just everything that have been in the configuration
+	// in the past but is no longer and so needs to be removed from the state.
+
+	for value := range s.main.PlanBeingApplied().DeletedOutputValues.All() {
+		changes = append(changes, &stackstate.AppliedChangeOutputValue{
+			Addr:  value,
+			Value: cty.NilVal,
+		})
+	}
+
+	for value := range s.main.PlanBeingApplied().DeletedInputVariables.All() {
+		changes = append(changes, &stackstate.AppliedChangeInputVariable{
+			Addr:  value,
+			Value: cty.NilVal,
+		})
+	}
+
+	for value := range s.main.PlanBeingApplied().DeletedComponents.All() {
+		changes = append(changes, &stackstate.AppliedChangeComponentInstanceRemoved{
+			ComponentAddr: stackaddrs.AbsComponent{
+				Stack: value.Stack,
+				Item:  value.Item.Component,
+			},
+			ComponentInstanceAddr: value,
+		})
+	}
+
+	return changes, diags
 }
 
 func (s *Stack) tracingName() string {

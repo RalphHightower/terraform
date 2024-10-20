@@ -22,6 +22,8 @@ import (
 // changes are represented in other ways inside the stacks language runtime.
 type State struct {
 	componentInstances collections.Map[stackaddrs.AbsComponentInstance, *componentInstanceState]
+	outputs            map[stackaddrs.OutputValue]cty.Value
+	inputs             map[stackaddrs.InputVariable]cty.Value
 
 	// discardUnsupportedKeys is the set of state keys that we encountered
 	// during decoding which are of types that are not supported by this
@@ -38,9 +40,37 @@ type State struct {
 func NewState() *State {
 	return &State{
 		componentInstances:     collections.NewMap[stackaddrs.AbsComponentInstance, *componentInstanceState](),
+		outputs:                make(map[stackaddrs.OutputValue]cty.Value),
+		inputs:                 make(map[stackaddrs.InputVariable]cty.Value),
 		discardUnsupportedKeys: statekeys.NewKeySet(),
 		inputRaw:               nil,
 	}
+}
+
+// RootInputVariables returns the values for the input variables currently in
+// the state. An address that is in the map and maps to cty.NilVal is an
+// ephemeral input, so it was present during the last operation but the value
+// in unknown. Compared to an input variable not in the map at all, which
+// indicates a new input variable that wasn't in the configuration during the
+// last operation.
+func (s *State) RootInputVariables() map[stackaddrs.InputVariable]cty.Value {
+	return s.inputs
+}
+
+// RootInputVariable returns the input variable defined at the given address.
+// If the second return value is true, then the value is present but is
+// ephemeral and not known. If the first returned value is cty.NilVal and the
+// second is false then the value isn't present in the state.
+func (s *State) RootInputVariable(addr stackaddrs.InputVariable) cty.Value {
+	return s.inputs[addr]
+}
+
+func (s *State) RootOutputValues() map[stackaddrs.OutputValue]cty.Value {
+	return s.outputs
+}
+
+func (s *State) RootOutputValue(addr stackaddrs.OutputValue) cty.Value {
+	return s.outputs[addr]
 }
 
 func (s *State) HasComponentInstance(addr stackaddrs.AbsComponentInstance) bool {
@@ -62,8 +92,8 @@ func (s *State) AllComponentInstances() collections.Set[stackaddrs.AbsComponentI
 		return ret
 	}
 	ret = collections.NewSet[stackaddrs.AbsComponentInstance]()
-	for _, elem := range s.componentInstances.Elems() {
-		ret.Add(elem.K)
+	for key := range s.componentInstances.All() {
+		ret.Add(key)
 	}
 	return ret
 }
@@ -75,15 +105,15 @@ func (s *State) AllComponentInstances() collections.Set[stackaddrs.AbsComponentI
 // This will always be a subset of AllComponentInstances.
 func (s *State) ComponentInstances(addr stackaddrs.AbsComponent) collections.Set[stackaddrs.ComponentInstance] {
 	ret := collections.NewSet[stackaddrs.ComponentInstance]()
-	for _, elem := range s.componentInstances.Elems() {
-		if elem.K.Stack.String() != addr.Stack.String() {
+	for key := range s.componentInstances.All() {
+		if key.Stack.String() != addr.Stack.String() {
 			// Then
 			continue
 		}
-		if elem.K.Item.Component.Name != addr.Item.Name {
+		if key.Item.Component.Name != addr.Item.Name {
 			continue
 		}
-		ret.Add(elem.K.Item)
+		ret.Add(key.Item)
 	}
 	return ret
 }
@@ -158,9 +188,9 @@ func (s *State) ComponentInstanceResourceInstanceObjects(addr stackaddrs.AbsComp
 // instance objects that are tracked in the state, across all components.
 func (s *State) AllResourceInstanceObjects() collections.Set[stackaddrs.AbsResourceInstanceObject] {
 	ret := collections.NewSet[stackaddrs.AbsResourceInstanceObject]()
-	for _, elem := range s.componentInstances.Elems() {
-		componentAddr := elem.K
-		for _, elem := range elem.V.resourceInstanceObjects.Elems {
+	for key, elem := range s.componentInstances.All() {
+		componentAddr := key
+		for _, elem := range elem.resourceInstanceObjects.Elems {
 			objKey := stackaddrs.AbsResourceInstanceObject{
 				Component: componentAddr,
 				Item:      elem.Key,
@@ -223,7 +253,7 @@ func (s *State) resourceInstanceObjectState(addr stackaddrs.AbsResourceInstanceO
 func (s *State) ComponentInstanceStateForModulesRuntime(addr stackaddrs.AbsComponentInstance) *states.State {
 	return states.BuildState(func(ss *states.SyncState) {
 		objAddrs := s.ComponentInstanceResourceInstanceObjects(addr)
-		for _, objAddr := range objAddrs.Elems() {
+		for objAddr := range objAddrs.All() {
 			rios := s.resourceInstanceObjectState(objAddr)
 
 			if objAddr.Item.IsCurrent() {
@@ -258,6 +288,14 @@ func (s *State) RawKeysToDiscard() collections.Set[statekeys.Key] {
 // the map or anything reachable through it.
 func (s *State) InputRaw() map[string]*anypb.Any {
 	return s.inputRaw
+}
+
+func (s *State) addOutputValue(addr stackaddrs.OutputValue, value cty.Value) {
+	s.outputs[addr] = value
+}
+
+func (s *State) addInputVariable(addr stackaddrs.InputVariable, value cty.Value) {
+	s.inputs[addr] = value
 }
 
 func (s *State) ensureComponentInstanceState(addr stackaddrs.AbsComponentInstance) *componentInstanceState {

@@ -45,17 +45,30 @@ func (s *StateBuilder) AddResourceInstance(builder *ResourceInstanceBuilder) *St
 	return s
 }
 
+// AddComponentInstance adds a component instance to the state.
 func (s *StateBuilder) AddComponentInstance(builder *ComponentInstanceBuilder) *StateBuilder {
 	component := s.state.ensureComponentInstanceState(builder.addr)
 	component.outputValues = builder.outputValues
 	component.inputVariables = builder.inputVariables
 
-	for _, dep := range builder.dependencies.Elems() {
+	for dep := range builder.dependencies.All() {
 		component.dependencies.Add(dep)
 	}
-	for _, dep := range builder.dependents.Elems() {
+	for dep := range builder.dependents.All() {
 		component.dependents.Add(dep)
 	}
+	return s
+}
+
+// AddOutput adds an output to the state.
+func (s *StateBuilder) AddOutput(name string, value cty.Value) *StateBuilder {
+	s.state.outputs[stackaddrs.OutputValue{Name: name}] = value
+	return s
+}
+
+// AddInput adds an input variable to the state.
+func (s *StateBuilder) AddInput(name string, value cty.Value) *StateBuilder {
+	s.state.inputs[stackaddrs.InputVariable{Name: name}] = value
 	return s
 }
 

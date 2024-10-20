@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -18,7 +19,6 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/zclconf/go-cty-debug/ctydebug"
 	"github.com/zclconf/go-cty/cty"
-	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/hashicorp/terraform/internal/addrs"
 	terraformProvider "github.com/hashicorp/terraform/internal/builtin/providers/terraform"
@@ -44,6 +44,1369 @@ var changesCmpOpts = cmp.Options{
 	cmpCollectionsSet,
 	cmpopts.IgnoreUnexported(addrs.InputVariable{}),
 	cmpopts.IgnoreUnexported(states.ResourceInstanceObjectSrc{}),
+}
+
+// TestApply uses a generic framework for running apply integration tests
+// against Stacks. Generally, new tests should be added into this function
+// rather than copying the large amount of duplicate code from the other
+// tests in this file.
+//
+// If you are editing other tests in this file, please consider moving them
+// into this test function so they can reuse the shared setup and boilerplate
+// code managing the boring parts of the test.
+func TestApply(t *testing.T) {
+
+	fakePlanTimestamp, err := time.Parse(time.RFC3339, "2021-01-01T00:00:00Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tcs := map[string]struct {
+		path   string
+		state  *stackstate.State
+		store  *stacks_testing_provider.ResourceStore
+		cycles []TestCycle
+	}{
+		"creating inputs and outputs": {
+			path: "component-input-output",
+			cycles: []TestCycle{
+				{
+					planInputs: map[string]cty.Value{
+						"value": cty.StringVal("foo"),
+					},
+					wantPlannedChanges: []stackplan.PlannedChange{
+						&stackplan.PlannedChangeApplyable{
+							Applyable: true,
+						},
+						&stackplan.PlannedChangeHeader{
+							TerraformVersion: version.SemVer,
+						},
+						&stackplan.PlannedChangeOutputValue{
+							Addr:   mustStackOutputValue("value"),
+							Action: plans.Create,
+							Before: cty.NullVal(cty.DynamicPseudoType),
+							After:  cty.StringVal("foo"),
+						},
+						&stackplan.PlannedChangePlannedTimestamp{
+							PlannedTimestamp: fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeRootInputValue{
+							Addr:   mustStackInputVariable("value"),
+							Action: plans.Create,
+							Before: cty.NullVal(cty.DynamicPseudoType),
+							After:  cty.StringVal("foo"),
+						},
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeOutputValue{
+							Addr:  mustStackOutputValue("value"),
+							Value: cty.StringVal("foo"),
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("value"),
+							Value: cty.StringVal("foo"),
+						},
+					},
+				},
+			},
+		},
+		"updating inputs and outputs": {
+			path: "component-input-output",
+			cycles: []TestCycle{
+				{
+					planInputs: map[string]cty.Value{
+						"value": cty.StringVal("foo"),
+					},
+				},
+				{
+					planInputs: map[string]cty.Value{
+						"value": cty.StringVal("bar"),
+					},
+					wantPlannedChanges: []stackplan.PlannedChange{
+						&stackplan.PlannedChangeApplyable{
+							Applyable: true,
+						},
+						&stackplan.PlannedChangeHeader{
+							TerraformVersion: version.SemVer,
+						},
+						&stackplan.PlannedChangeOutputValue{
+							Addr:   mustStackOutputValue("value"),
+							Action: plans.Update,
+							Before: cty.StringVal("foo"),
+							After:  cty.StringVal("bar"),
+						},
+						&stackplan.PlannedChangePlannedTimestamp{
+							PlannedTimestamp: fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeRootInputValue{
+							Addr:   mustStackInputVariable("value"),
+							Action: plans.Update,
+							Before: cty.StringVal("foo"),
+							After:  cty.StringVal("bar"),
+						},
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeOutputValue{
+							Addr:  mustStackOutputValue("value"),
+							Value: cty.StringVal("bar"),
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("value"),
+							Value: cty.StringVal("bar"),
+						},
+					},
+				},
+			},
+		},
+		"updating inputs and outputs (noop)": {
+			path: "component-input-output",
+			cycles: []TestCycle{
+				{
+					planInputs: map[string]cty.Value{
+						"value": cty.StringVal("foo"),
+					},
+				},
+				{
+					planInputs: map[string]cty.Value{
+						"value": cty.StringVal("foo"),
+					},
+					wantPlannedChanges: []stackplan.PlannedChange{
+						&stackplan.PlannedChangeApplyable{
+							Applyable: true,
+						},
+						&stackplan.PlannedChangeHeader{
+							TerraformVersion: version.SemVer,
+						},
+						&stackplan.PlannedChangeOutputValue{
+							Addr:   mustStackOutputValue("value"),
+							Action: plans.NoOp,
+							Before: cty.StringVal("foo"),
+							After:  cty.StringVal("foo"),
+						},
+						&stackplan.PlannedChangePlannedTimestamp{
+							PlannedTimestamp: fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeRootInputValue{
+							Addr:   mustStackInputVariable("value"),
+							Action: plans.NoOp,
+							Before: cty.StringVal("foo"),
+							After:  cty.StringVal("foo"),
+						},
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeOutputValue{
+							Addr:  mustStackOutputValue("value"),
+							Value: cty.StringVal("foo"),
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("value"),
+							Value: cty.StringVal("foo"),
+						},
+					},
+				},
+			},
+		},
+		"deleting inputs and outputs": {
+			path: "component-input-output",
+			state: stackstate.NewStateBuilder().
+				AddInput("removed", cty.StringVal("bar")).
+				AddOutput("removed", cty.StringVal("bar")).
+				Build(),
+			cycles: []TestCycle{
+				{
+					planInputs: map[string]cty.Value{
+						"value": cty.StringVal("foo"),
+					},
+					wantPlannedChanges: []stackplan.PlannedChange{
+						&stackplan.PlannedChangeApplyable{
+							Applyable: true,
+						},
+						&stackplan.PlannedChangeHeader{
+							TerraformVersion: version.SemVer,
+						},
+						&stackplan.PlannedChangeOutputValue{
+							Addr:   mustStackOutputValue("removed"),
+							Action: plans.Delete,
+							Before: cty.StringVal("bar"),
+							After:  cty.NullVal(cty.DynamicPseudoType),
+						},
+						&stackplan.PlannedChangeOutputValue{
+							Addr:   mustStackOutputValue("value"),
+							Action: plans.Create,
+							Before: cty.NullVal(cty.DynamicPseudoType),
+							After:  cty.StringVal("foo"),
+						},
+						&stackplan.PlannedChangePlannedTimestamp{
+							PlannedTimestamp: fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeRootInputValue{
+							Addr:   mustStackInputVariable("removed"),
+							Action: plans.Delete,
+							Before: cty.StringVal("bar"),
+							After:  cty.NullVal(cty.DynamicPseudoType),
+						},
+						&stackplan.PlannedChangeRootInputValue{
+							Addr:   mustStackInputVariable("value"),
+							Action: plans.Create,
+							Before: cty.NullVal(cty.DynamicPseudoType),
+							After:  cty.StringVal("foo"),
+						},
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeOutputValue{
+							Addr: mustStackOutputValue("removed"),
+						},
+						&stackstate.AppliedChangeOutputValue{
+							Addr:  mustStackOutputValue("value"),
+							Value: cty.StringVal("foo"),
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("removed"),
+							Value: cty.NilVal, // destroyed
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("value"),
+							Value: cty.StringVal("foo"),
+						},
+					},
+				},
+			},
+		},
+		"checkable objects": {
+			path: "checkable-objects",
+			cycles: []TestCycle{
+				{
+					planInputs: map[string]cty.Value{
+						"foo": cty.StringVal("bar"),
+					},
+					wantPlannedDiags: initDiags(func(diags tfdiags.Diagnostics) tfdiags.Diagnostics {
+						return diags.Append(&hcl.Diagnostic{
+							Severity: hcl.DiagWarning,
+							Summary:  "Check block assertion failed",
+							Detail:   `value must be 'baz'`,
+							Subject: &hcl.Range{
+								Filename: mainBundleSourceAddrStr("checkable-objects/checkable-objects.tf"),
+								Start:    hcl.Pos{Line: 41, Column: 21, Byte: 716},
+								End:      hcl.Pos{Line: 41, Column: 57, Byte: 752},
+							},
+						})
+					}),
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstance{
+							ComponentAddr:         mustAbsComponent("component.single"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.single"),
+							OutputValues: map[addrs.OutputValue]cty.Value{
+								addrs.OutputValue{Name: "foo"}: cty.StringVal("bar"),
+							},
+							InputVariables: map[addrs.InputVariable]cty.Value{
+								mustInputVariable("foo"): cty.StringVal("bar"),
+							},
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.single.testing_resource.main"),
+							NewStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+									"id":    "test",
+									"value": "bar",
+								}),
+								Status:       states.ObjectReady,
+								Dependencies: make([]addrs.ConfigResource, 0),
+							},
+							ProviderConfigAddr: addrs.AbsProviderConfig{
+								Provider: addrs.NewDefaultProvider("testing"),
+							},
+							Schema: stacks_testing_provider.TestingResourceSchema,
+						},
+					},
+					wantAppliedDiags: initDiags(func(diags tfdiags.Diagnostics) tfdiags.Diagnostics {
+						return diags.Append(&hcl.Diagnostic{
+							Severity: hcl.DiagWarning,
+							Summary:  "Check block assertion failed",
+							Detail:   `value must be 'baz'`,
+							Subject: &hcl.Range{
+								Filename: mainBundleSourceAddrStr("checkable-objects/checkable-objects.tf"),
+								Start:    hcl.Pos{Line: 41, Column: 21, Byte: 716},
+								End:      hcl.Pos{Line: 41, Column: 57, Byte: 752},
+							},
+						})
+					}),
+				},
+				{
+					planMode: plans.DestroyMode,
+					planInputs: map[string]cty.Value{
+						"foo": cty.StringVal("bar"),
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							ComponentAddr:         mustAbsComponent("component.single"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.single"),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.single.testing_resource.main"),
+							ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+						},
+					},
+				},
+			},
+		},
+		"removed component": {
+			path: filepath.Join("with-single-input", "removed-component"),
+			state: stackstate.NewStateBuilder().
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.self")).
+					AddInputVariable("id", cty.StringVal("removed")).
+					AddInputVariable("input", cty.StringVal("removed"))).
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.self.testing_resource.data")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						Status: states.ObjectReady,
+						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+							"id":    "removed",
+							"value": "removed",
+						}),
+					})).
+				Build(),
+			store: stacks_testing_provider.NewResourceStoreBuilder().
+				AddResource("removed", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("removed"),
+					"value": cty.StringVal("removed"),
+				})).
+				Build(),
+			cycles: []TestCycle{
+				{
+					planInputs: map[string]cty.Value{},
+					wantPlannedChanges: []stackplan.PlannedChange{
+						&stackplan.PlannedChangeApplyable{
+							Applyable: true,
+						},
+						&stackplan.PlannedChangeComponentInstance{
+							Addr:          mustAbsComponentInstance("component.self"),
+							PlanComplete:  true,
+							PlanApplyable: true,
+							Mode:          plans.DestroyMode,
+							Action:        plans.Delete,
+							PlannedInputValues: map[string]plans.DynamicValue{
+								"id":    mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
+								"input": mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
+							},
+							PlannedInputValueMarks: map[string][]cty.PathValueMarks{
+								"input": nil,
+								"id":    nil,
+							},
+							PlannedOutputValues: make(map[string]cty.Value),
+							PlannedCheckResults: &states.CheckResults{},
+							PlanTimestamp:       fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeResourceInstancePlanned{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+							ChangeSrc: &plans.ResourceInstanceChangeSrc{
+								Addr:        mustAbsResourceInstance("testing_resource.data"),
+								PrevRunAddr: mustAbsResourceInstance("testing_resource.data"),
+								ChangeSrc: plans.ChangeSrc{
+									Action: plans.Delete,
+									Before: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
+										"id":    cty.StringVal("removed"),
+										"value": cty.StringVal("removed"),
+									})),
+									After: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
+										"id":    cty.String,
+										"value": cty.String,
+									}))),
+								},
+								ProviderAddr: mustDefaultRootProvider("testing"),
+							},
+							PriorStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+									"id":    "removed",
+									"value": "removed",
+								}),
+								Dependencies: make([]addrs.ConfigResource, 0),
+								Status:       states.ObjectReady,
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackplan.PlannedChangeHeader{
+							TerraformVersion: version.SemVer,
+						},
+						&stackplan.PlannedChangePlannedTimestamp{
+							PlannedTimestamp: fakePlanTimestamp,
+						},
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							ComponentAddr:         mustAbsComponent("component.self"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+							ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+							NewStateSrc:                nil,
+							Schema:                     nil,
+						},
+					},
+				},
+			},
+		},
+		"removed component instance": {
+			path: filepath.Join("with-single-input", "removed-component-instance"),
+			state: stackstate.NewStateBuilder().
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.self[\"removed\"]")).
+					AddInputVariable("id", cty.StringVal("removed")).
+					AddInputVariable("input", cty.StringVal("removed"))).
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.self[\"removed\"].testing_resource.data")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						Status: states.ObjectReady,
+						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+							"id":    "removed",
+							"value": "removed",
+						}),
+					})).
+				Build(),
+			store: stacks_testing_provider.NewResourceStoreBuilder().
+				AddResource("removed", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("removed"),
+					"value": cty.StringVal("removed"),
+				})).
+				Build(),
+			cycles: []TestCycle{
+				{
+					planInputs: map[string]cty.Value{
+						"input": cty.SetVal([]cty.Value{
+							cty.StringVal("added"),
+						}),
+						"removed": cty.SetVal([]cty.Value{
+							cty.StringVal("removed"),
+						}),
+					},
+					wantPlannedChanges: []stackplan.PlannedChange{
+						&stackplan.PlannedChangeApplyable{
+							Applyable: true,
+						},
+						// we're expecting the new component to be created
+						&stackplan.PlannedChangeComponentInstance{
+							Addr:          mustAbsComponentInstance("component.self[\"added\"]"),
+							PlanComplete:  true,
+							PlanApplyable: true,
+							Action:        plans.Create,
+							PlannedInputValues: map[string]plans.DynamicValue{
+								"id":    mustPlanDynamicValueDynamicType(cty.StringVal("added")),
+								"input": mustPlanDynamicValueDynamicType(cty.StringVal("added")),
+							},
+							PlannedInputValueMarks: map[string][]cty.PathValueMarks{
+								"input": nil,
+								"id":    nil,
+							},
+							PlannedOutputValues: make(map[string]cty.Value),
+							PlannedCheckResults: &states.CheckResults{},
+							PlanTimestamp:       fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeResourceInstancePlanned{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"added\"].testing_resource.data"),
+							ChangeSrc: &plans.ResourceInstanceChangeSrc{
+								Addr:        mustAbsResourceInstance("testing_resource.data"),
+								PrevRunAddr: mustAbsResourceInstance("testing_resource.data"),
+								ChangeSrc: plans.ChangeSrc{
+									Action: plans.Create,
+									Before: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
+										"id":    cty.String,
+										"value": cty.String,
+									}))),
+									After: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
+										"id":    cty.StringVal("added"),
+										"value": cty.StringVal("added"),
+									})),
+								},
+								ProviderAddr: mustDefaultRootProvider("testing"),
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackplan.PlannedChangeComponentInstance{
+							Addr:          mustAbsComponentInstance("component.self[\"removed\"]"),
+							PlanComplete:  true,
+							PlanApplyable: true,
+							Mode:          plans.DestroyMode,
+							Action:        plans.Delete,
+							PlannedInputValues: map[string]plans.DynamicValue{
+								"id":    mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
+								"input": mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
+							},
+							PlannedInputValueMarks: map[string][]cty.PathValueMarks{
+								"input": nil,
+								"id":    nil,
+							},
+							PlannedOutputValues: make(map[string]cty.Value),
+							PlannedCheckResults: &states.CheckResults{},
+							PlanTimestamp:       fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeResourceInstancePlanned{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"removed\"].testing_resource.data"),
+							ChangeSrc: &plans.ResourceInstanceChangeSrc{
+								Addr:        mustAbsResourceInstance("testing_resource.data"),
+								PrevRunAddr: mustAbsResourceInstance("testing_resource.data"),
+								ChangeSrc: plans.ChangeSrc{
+									Action: plans.Delete,
+									Before: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
+										"id":    cty.StringVal("removed"),
+										"value": cty.StringVal("removed"),
+									})),
+									After: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
+										"id":    cty.String,
+										"value": cty.String,
+									}))),
+								},
+								ProviderAddr: mustDefaultRootProvider("testing"),
+							},
+							PriorStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+									"id":    "removed",
+									"value": "removed",
+								}),
+								Dependencies: make([]addrs.ConfigResource, 0),
+								Status:       states.ObjectReady,
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackplan.PlannedChangeHeader{
+							TerraformVersion: version.SemVer,
+						},
+						&stackplan.PlannedChangePlannedTimestamp{
+							PlannedTimestamp: fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeRootInputValue{
+							Addr:   stackaddrs.InputVariable{Name: "input"},
+							Action: plans.Create,
+							Before: cty.NullVal(cty.DynamicPseudoType),
+							After: cty.SetVal([]cty.Value{
+								cty.StringVal("added"),
+							}),
+						},
+						&stackplan.PlannedChangeRootInputValue{
+							Addr:   stackaddrs.InputVariable{Name: "removed"},
+							Action: plans.Create,
+							Before: cty.NullVal(cty.DynamicPseudoType),
+							After: cty.SetVal([]cty.Value{
+								cty.StringVal("removed"),
+							}),
+						},
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstance{
+							ComponentAddr:         mustAbsComponent("component.self"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.self[\"added\"]"),
+							OutputValues:          make(map[addrs.OutputValue]cty.Value),
+							InputVariables: map[addrs.InputVariable]cty.Value{
+								mustInputVariable("id"):    cty.StringVal("added"),
+								mustInputVariable("input"): cty.StringVal("added"),
+							},
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"added\"].testing_resource.data"),
+							NewStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+									"id":    "added",
+									"value": "added",
+								}),
+								Status:       states.ObjectReady,
+								Dependencies: make([]addrs.ConfigResource, 0),
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							ComponentAddr:         mustAbsComponent("component.self"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.self[\"removed\"]"),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"removed\"].testing_resource.data"),
+							ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+							NewStateSrc:                nil,
+							Schema:                     nil,
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr: mustStackInputVariable("input"),
+							Value: cty.SetVal([]cty.Value{
+								cty.StringVal("added"),
+							}),
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr: mustStackInputVariable("removed"),
+							Value: cty.SetVal([]cty.Value{
+								cty.StringVal("removed"),
+							}),
+						},
+					},
+				},
+			},
+		},
+		"removed embedded component": {
+			path: filepath.Join("with-single-input", "removed-embedded-component"),
+			state: stackstate.NewStateBuilder().
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("stack.a.component.self")).
+					AddInputVariable("id", cty.StringVal("removed")).
+					AddInputVariable("input", cty.StringVal("removed"))).
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("stack.a.component.self.testing_resource.data")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						Status: states.ObjectReady,
+						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+							"id":    "removed",
+							"value": "removed",
+						}),
+					})).
+				Build(),
+			store: stacks_testing_provider.NewResourceStoreBuilder().
+				AddResource("removed", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("removed"),
+					"value": cty.StringVal("removed"),
+				})).
+				Build(),
+			cycles: []TestCycle{
+				{
+					wantPlannedChanges: []stackplan.PlannedChange{
+						&stackplan.PlannedChangeApplyable{
+							Applyable: true,
+						},
+						&stackplan.PlannedChangeHeader{
+							TerraformVersion: version.SemVer,
+						},
+						&stackplan.PlannedChangePlannedTimestamp{
+							PlannedTimestamp: fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeComponentInstance{
+							Addr:          mustAbsComponentInstance("stack.a.component.self"),
+							PlanComplete:  true,
+							PlanApplyable: true,
+							Mode:          plans.DestroyMode,
+							Action:        plans.Delete,
+							PlannedInputValues: map[string]plans.DynamicValue{
+								"id":    mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
+								"input": mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
+							},
+							PlannedInputValueMarks: map[string][]cty.PathValueMarks{
+								"input": nil,
+								"id":    nil,
+							},
+							PlannedOutputValues: make(map[string]cty.Value),
+							PlannedCheckResults: &states.CheckResults{},
+							PlanTimestamp:       fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeResourceInstancePlanned{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("stack.a.component.self.testing_resource.data"),
+							ChangeSrc: &plans.ResourceInstanceChangeSrc{
+								Addr:        mustAbsResourceInstance("testing_resource.data"),
+								PrevRunAddr: mustAbsResourceInstance("testing_resource.data"),
+								ChangeSrc: plans.ChangeSrc{
+									Action: plans.Delete,
+									Before: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
+										"id":    cty.StringVal("removed"),
+										"value": cty.StringVal("removed"),
+									})),
+									After: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
+										"id":    cty.String,
+										"value": cty.String,
+									}))),
+								},
+								ProviderAddr: mustDefaultRootProvider("testing"),
+							},
+							PriorStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+									"id":    "removed",
+									"value": "removed",
+								}),
+								Dependencies: make([]addrs.ConfigResource, 0),
+								Status:       states.ObjectReady,
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							ComponentAddr:         mustAbsComponent("stack.a.component.self"),
+							ComponentInstanceAddr: mustAbsComponentInstance("stack.a.component.self"),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("stack.a.component.self.testing_resource.data"),
+							ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+							NewStateSrc:                nil,
+							Schema:                     nil,
+						},
+					},
+				},
+			},
+		},
+		"forgotten component": {
+			path: filepath.Join("with-single-input", "forgotten-component"),
+			state: stackstate.NewStateBuilder().
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.self")).
+					AddInputVariable("id", cty.StringVal("removed")).
+					AddInputVariable("input", cty.StringVal("removed"))).
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.self.testing_resource.data")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						Status: states.ObjectReady,
+						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+							"id":    "removed",
+							"value": "removed",
+						}),
+					})).
+				Build(),
+			store: stacks_testing_provider.NewResourceStoreBuilder().
+				AddResource("removed", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("removed"),
+					"value": cty.StringVal("removed"),
+				})).
+				Build(),
+			cycles: []TestCycle{
+				{
+					planInputs: map[string]cty.Value{
+						"destroy": cty.BoolVal(false),
+					},
+					wantPlannedChanges: []stackplan.PlannedChange{
+						&stackplan.PlannedChangeApplyable{
+							Applyable: true,
+						},
+						&stackplan.PlannedChangeComponentInstance{
+							Addr:          mustAbsComponentInstance("component.self"),
+							PlanComplete:  true,
+							PlanApplyable: true,
+							Mode:          plans.DestroyMode,
+							Action:        plans.Forget,
+							PlannedInputValues: map[string]plans.DynamicValue{
+								"id":    mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
+								"input": mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
+							},
+							PlannedInputValueMarks: map[string][]cty.PathValueMarks{
+								"input": nil,
+								"id":    nil,
+							},
+							PlannedOutputValues: make(map[string]cty.Value),
+							PlannedCheckResults: &states.CheckResults{},
+							PlanTimestamp:       fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeResourceInstancePlanned{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+							ChangeSrc: &plans.ResourceInstanceChangeSrc{
+								Addr:        mustAbsResourceInstance("testing_resource.data"),
+								PrevRunAddr: mustAbsResourceInstance("testing_resource.data"),
+								ChangeSrc: plans.ChangeSrc{
+									Action: plans.Forget,
+									Before: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
+										"id":    cty.StringVal("removed"),
+										"value": cty.StringVal("removed"),
+									})),
+									After: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
+										"id":    cty.String,
+										"value": cty.String,
+									}))),
+								},
+								ProviderAddr: mustDefaultRootProvider("testing"),
+							},
+							PriorStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]any{
+									"id":    "removed",
+									"value": "removed",
+								}),
+								Dependencies: make([]addrs.ConfigResource, 0),
+								Status:       states.ObjectReady,
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackplan.PlannedChangeHeader{
+							TerraformVersion: version.SemVer,
+						},
+						&stackplan.PlannedChangePlannedTimestamp{
+							PlannedTimestamp: fakePlanTimestamp,
+						},
+					},
+					wantPlannedDiags: initDiags(func(diags tfdiags.Diagnostics) tfdiags.Diagnostics {
+						return diags.Append(tfdiags.Sourceless(
+							tfdiags.Warning,
+							"Some objects will no longer be managed by Terraform",
+							`If you apply this plan, Terraform will discard its tracking information for the following objects, but it will not delete them:
+ - testing_resource.data
+
+After applying this plan, Terraform will no longer manage these objects. You will need to import them into Terraform to manage them again.`,
+						))
+					}),
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							ComponentAddr:         mustAbsComponent("component.self"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+							ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+							NewStateSrc:                nil,
+							Schema:                     nil,
+						},
+					},
+				},
+			},
+		},
+		"orphaned component": {
+			path: filepath.Join("with-single-input", "valid"),
+			state: stackstate.NewStateBuilder().
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.orphan"))).
+				Build(),
+			cycles: []TestCycle{
+				{
+					planInputs: map[string]cty.Value{
+						"id":    cty.StringVal("foo"),
+						"input": cty.StringVal("bar"),
+					},
+					wantPlannedChanges: []stackplan.PlannedChange{
+						&stackplan.PlannedChangeApplyable{
+							Applyable: true,
+						},
+						&stackplan.PlannedChangeComponentInstanceRemoved{
+							// The orphaned component is just silently being removed.
+							Addr: mustAbsComponentInstance("component.orphan"),
+						},
+						&stackplan.PlannedChangeComponentInstance{
+							Addr:          mustAbsComponentInstance("component.self"),
+							PlanApplyable: true,
+							PlanComplete:  true,
+							Action:        plans.Create,
+							PlannedInputValues: map[string]plans.DynamicValue{
+								"id":    mustPlanDynamicValueDynamicType(cty.StringVal("foo")),
+								"input": mustPlanDynamicValueDynamicType(cty.StringVal("bar")),
+							},
+							PlannedInputValueMarks: map[string][]cty.PathValueMarks{
+								"id":    nil,
+								"input": nil,
+							},
+							PlannedOutputValues: make(map[string]cty.Value),
+							PlannedCheckResults: &states.CheckResults{},
+							PlanTimestamp:       fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeResourceInstancePlanned{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+							ChangeSrc: &plans.ResourceInstanceChangeSrc{
+								Addr:         mustAbsResourceInstance("testing_resource.data"),
+								PrevRunAddr:  mustAbsResourceInstance("testing_resource.data"),
+								ProviderAddr: mustDefaultRootProvider("testing"),
+								ChangeSrc: plans.ChangeSrc{
+									Action: plans.Create,
+									Before: mustPlanDynamicValue(cty.NullVal(cty.DynamicPseudoType)),
+									After: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
+										"id":    cty.StringVal("foo"),
+										"value": cty.StringVal("bar"),
+									})),
+								},
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackplan.PlannedChangeHeader{
+							TerraformVersion: version.SemVer,
+						},
+						&stackplan.PlannedChangePlannedTimestamp{
+							PlannedTimestamp: fakePlanTimestamp,
+						},
+						&stackplan.PlannedChangeRootInputValue{
+							Addr: stackaddrs.InputVariable{
+								Name: "id",
+							},
+							Action: plans.Create,
+							Before: cty.NullVal(cty.DynamicPseudoType),
+							After:  cty.StringVal("foo"),
+						},
+						&stackplan.PlannedChangeRootInputValue{
+							Addr: stackaddrs.InputVariable{
+								Name: "input",
+							},
+							Action: plans.Create,
+							Before: cty.NullVal(cty.DynamicPseudoType),
+							After:  cty.StringVal("bar"),
+						},
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							// The orphaned component is just silently being removed.
+							ComponentAddr:         mustAbsComponent("component.orphan"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.orphan"),
+						},
+						&stackstate.AppliedChangeComponentInstance{
+							ComponentAddr:         mustAbsComponent("component.self"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+							OutputValues:          make(map[addrs.OutputValue]cty.Value),
+							InputVariables: map[addrs.InputVariable]cty.Value{
+								mustInputVariable("id"):    cty.StringVal("foo"),
+								mustInputVariable("input"): cty.StringVal("bar"),
+							},
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+							NewStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+									"id":    "foo",
+									"value": "bar",
+								}),
+								Dependencies: make([]addrs.ConfigResource, 0),
+								Status:       states.ObjectReady,
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("id"),
+							Value: cty.StringVal("foo"),
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("input"),
+							Value: cty.StringVal("bar"),
+						},
+					},
+				},
+			},
+		},
+		"forget with dependency": {
+			path: "forget_with_dependency",
+			state: stackstate.NewStateBuilder().
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.one")).
+					AddDependent(mustAbsComponent("component.two")).
+					AddInputVariable("value", cty.StringVal("bar")).
+					AddOutputValue("id", cty.StringVal("foo"))).
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.one.testing_resource.resource")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+							"id":    "foo",
+							"value": "bar",
+						}),
+						Status: states.ObjectReady,
+					})).
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.two")).
+					AddDependency(mustAbsComponent("component.one")).
+					AddInputVariable("value", cty.StringVal("foo")).
+					AddOutputValue("id", cty.StringVal("baz"))).
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.two.testing_resource.resource")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+							"id":    "baz",
+							"value": "foo",
+						}),
+						Status: states.ObjectReady,
+					})).
+				Build(),
+			store: stacks_testing_provider.NewResourceStoreBuilder().
+				AddResource("foo", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("foo"),
+					"value": cty.StringVal("bar"),
+				})).
+				AddResource("baz", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("baz"),
+					"value": cty.StringVal("foo"),
+				})).
+				Build(),
+			cycles: []TestCycle{
+				{
+					planMode: plans.NormalMode,
+					wantPlannedDiags: tfdiags.Diagnostics{
+						tfdiags.Sourceless(tfdiags.Warning, "Some objects will no longer be managed by Terraform", `If you apply this plan, Terraform will discard its tracking information for the following objects, but it will not delete them:
+ - testing_resource.resource
+
+After applying this plan, Terraform will no longer manage these objects. You will need to import them into Terraform to manage them again.`),
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstance{
+							ComponentAddr:         mustAbsComponent("component.one"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.one"),
+							OutputValues: map[addrs.OutputValue]cty.Value{
+								addrs.OutputValue{Name: "id"}: cty.StringVal("foo"),
+							},
+							InputVariables: map[addrs.InputVariable]cty.Value{
+								addrs.InputVariable{Name: "value"}: cty.StringVal("bar"),
+							},
+							Dependents: collections.NewSet(mustAbsComponent("component.two")),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.one.testing_resource.resource"),
+							NewStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+									"id":    "foo",
+									"value": "bar",
+								}),
+								Status:             states.ObjectReady,
+								AttrSensitivePaths: make([]cty.Path, 0),
+							},
+							ProviderConfigAddr: addrs.AbsProviderConfig{
+								Provider: addrs.MustParseProviderSourceString("hashicorp/testing"),
+							},
+							Schema: stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							ComponentAddr:         mustAbsComponent("component.two"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.two"),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.two.testing_resource.resource"),
+							NewStateSrc:                nil, // Resource is forgotten
+							ProviderConfigAddr: addrs.AbsProviderConfig{
+								Provider: addrs.MustParseProviderSourceString("hashicorp/testing"),
+							},
+						},
+					},
+				},
+			},
+		},
+		"forget with dependency on component to forget": {
+			path: "forget_with_dependency_to_forget",
+			state: stackstate.NewStateBuilder().
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.one")).
+					AddDependent(mustAbsComponent("component.two")).
+					AddInputVariable("value", cty.StringVal("bar")).
+					AddOutputValue("id", cty.StringVal("foo"))).
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.one.testing_resource.resource")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+							"id":    "foo",
+							"value": "bar",
+						}),
+						Status: states.ObjectReady,
+					})).
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.two")).
+					AddDependency(mustAbsComponent("component.one")).
+					AddInputVariable("value", cty.StringVal("foo")).
+					AddOutputValue("id", cty.StringVal("baz"))).
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.two.testing_resource.resource")).
+					SetProviderAddr(mustDefaultRootProvider("testing")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+							"id":    "baz",
+							"value": "foo",
+						}),
+						Status: states.ObjectReady,
+					})).
+				Build(),
+			store: stacks_testing_provider.NewResourceStoreBuilder().
+				AddResource("foo", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("foo"),
+					"value": cty.StringVal("bar"),
+				})).
+				AddResource("baz", cty.ObjectVal(map[string]cty.Value{
+					"id":    cty.StringVal("baz"),
+					"value": cty.StringVal("foo"),
+				})).
+				Build(),
+			cycles: []TestCycle{
+				{
+					planMode: plans.NormalMode,
+					wantPlannedDiags: tfdiags.Diagnostics{
+						tfdiags.Sourceless(tfdiags.Warning, "Some objects will no longer be managed by Terraform", `If you apply this plan, Terraform will discard its tracking information for the following objects, but it will not delete them:
+ - testing_resource.resource
+
+After applying this plan, Terraform will no longer manage these objects. You will need to import them into Terraform to manage them again.`),
+						tfdiags.Sourceless(tfdiags.Warning, "Some objects will no longer be managed by Terraform", `If you apply this plan, Terraform will discard its tracking information for the following objects, but it will not delete them:
+ - testing_resource.resource
+
+After applying this plan, Terraform will no longer manage these objects. You will need to import them into Terraform to manage them again.`),
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							ComponentAddr:         mustAbsComponent("component.one"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.one"),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.one.testing_resource.resource"),
+							NewStateSrc:                nil, // Resource is forgotten
+							ProviderConfigAddr: addrs.AbsProviderConfig{
+								Provider: addrs.MustParseProviderSourceString("hashicorp/testing"),
+							},
+						},
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							ComponentAddr:         mustAbsComponent("component.two"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.two"),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.two.testing_resource.resource"),
+							NewStateSrc:                nil, // Resource is forgotten
+							ProviderConfigAddr: addrs.AbsProviderConfig{
+								Provider: addrs.MustParseProviderSourceString("hashicorp/testing"),
+							},
+						},
+					},
+				},
+			},
+		},
+		"removed block with provider-to-component dep": {
+			path: path.Join("auth-provider-w-data", "removed"),
+			state: stackstate.NewStateBuilder().
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.load")).
+					AddDependent(mustAbsComponent("component.create")).
+					AddOutputValue("credentials", cty.StringVal("wrong"))). // must reload the credentials
+				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.create")).
+					AddDependency(mustAbsComponent("component.load"))).
+				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
+					SetAddr(mustAbsResourceInstanceObject("component.create.testing_resource.resource")).
+					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
+						AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+							"id":    "resource",
+							"value": nil,
+						}),
+						Status: states.ObjectReady,
+					}).
+					SetProviderAddr(mustDefaultRootProvider("testing"))).
+				Build(),
+			store: stacks_testing_provider.NewResourceStoreBuilder().AddResource("credentials", cty.ObjectVal(map[string]cty.Value{
+				"id": cty.StringVal("credentials"),
+				// we have the wrong value in state, so this correct value must
+				// be loaded for this test to work.
+				"value": cty.StringVal("authn"),
+			})).Build(),
+			cycles: []TestCycle{
+				{
+					planMode: plans.NormalMode,
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstanceRemoved{
+							ComponentAddr:         mustAbsComponent("component.create"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.create"),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.create.testing_resource.resource"),
+							ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+							NewStateSrc:                nil, // deleted
+						},
+						&stackstate.AppliedChangeComponentInstance{
+							ComponentAddr:         mustAbsComponent("component.load"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.load"),
+							OutputValues: map[addrs.OutputValue]cty.Value{
+								addrs.OutputValue{Name: "credentials"}: cty.StringVal("authn").Mark(marks.Sensitive),
+							},
+							InputVariables: make(map[addrs.InputVariable]cty.Value),
+							Dependents:     collections.NewSet(mustAbsComponent("component.create")),
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.load.data.testing_data_source.credentials"),
+							NewStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+									"id":    "credentials",
+									"value": "authn",
+								}),
+								AttrSensitivePaths: make([]cty.Path, 0),
+								Status:             states.ObjectReady,
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingDataSourceSchema,
+						},
+					},
+				},
+			},
+		},
+		"ephemeral": {
+			path: path.Join("with-single-input", "ephemeral"),
+			cycles: []TestCycle{
+				{
+					planMode: plans.NormalMode,
+					planInputs: map[string]cty.Value{
+						"input":     cty.StringVal("hello"),
+						"ephemeral": cty.StringVal("planning"),
+					},
+					applyInputs: map[string]cty.Value{
+						"ephemeral": cty.StringVal("applying"),
+					},
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstance{
+							ComponentAddr:         mustAbsComponent("component.self"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+							OutputValues:          make(map[addrs.OutputValue]cty.Value),
+							InputVariables: map[addrs.InputVariable]cty.Value{
+								mustInputVariable("id"):    cty.StringVal("2f9f3b84"),
+								mustInputVariable("input"): cty.StringVal("hello"),
+							},
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+							NewStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+									"id":    "2f9f3b84",
+									"value": "hello",
+								}),
+								Status:       states.ObjectReady,
+								Dependencies: make([]addrs.ConfigResource, 0),
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("ephemeral"),
+							Value: cty.NullVal(cty.String), // ephemeral
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("input"),
+							Value: cty.StringVal("hello"),
+						},
+					},
+				},
+			},
+		},
+		"missing-ephemeral": {
+			path: path.Join("with-single-input", "ephemeral"),
+			cycles: []TestCycle{
+				{
+					planMode: plans.NormalMode,
+					planInputs: map[string]cty.Value{
+						"input":     cty.StringVal("hello"),
+						"ephemeral": cty.StringVal("planning"),
+					},
+					applyInputs: make(map[string]cty.Value), // deliberately omitting ephemeral
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstance{
+							ComponentAddr:         mustAbsComponent("component.self"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+							OutputValues:          make(map[addrs.OutputValue]cty.Value),
+							InputVariables: map[addrs.InputVariable]cty.Value{
+								mustInputVariable("id"):    cty.StringVal("2f9f3b84"),
+								mustInputVariable("input"): cty.StringVal("hello"),
+							},
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+							NewStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+									"id":    "2f9f3b84",
+									"value": "hello",
+								}),
+								Status:       states.ObjectReady,
+								Dependencies: make([]addrs.ConfigResource, 0),
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("input"),
+							Value: cty.StringVal("hello"),
+						},
+					},
+					wantAppliedDiags: initDiags(func(diags tfdiags.Diagnostics) tfdiags.Diagnostics {
+						return diags.Append(&hcl.Diagnostic{
+							Severity: hcl.DiagError,
+							Summary:  "No value for required variable",
+							Detail:   "The root input variable \"var.ephemeral\" is not set, and has no default value.",
+							Subject: &hcl.Range{
+								Filename: "git::https://example.com/test.git//with-single-input/ephemeral/ephemeral.tfstack.hcl",
+								Start: hcl.Pos{
+									Line:   14,
+									Column: 1,
+									Byte:   175,
+								},
+								End: hcl.Pos{
+									Line:   14,
+									Column: 21,
+									Byte:   195,
+								},
+							},
+						})
+					}),
+				},
+			},
+		},
+		"ephemeral-default": {
+			path: path.Join("with-single-input", "ephemeral-default"),
+			cycles: []TestCycle{
+				{
+					planMode: plans.NormalMode,
+					planInputs: map[string]cty.Value{
+						"input": cty.StringVal("hello"),
+						// deliberately omitting ephemeral
+					},
+					applyInputs: make(map[string]cty.Value), // deliberately omitting ephemeral
+					wantAppliedChanges: []stackstate.AppliedChange{
+						&stackstate.AppliedChangeComponentInstance{
+							ComponentAddr:         mustAbsComponent("component.self"),
+							ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
+							OutputValues:          make(map[addrs.OutputValue]cty.Value),
+							InputVariables: map[addrs.InputVariable]cty.Value{
+								mustInputVariable("id"):    cty.StringVal("2f9f3b84"),
+								mustInputVariable("input"): cty.StringVal("hello"),
+							},
+						},
+						&stackstate.AppliedChangeResourceInstanceObject{
+							ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
+							NewStateSrc: &states.ResourceInstanceObjectSrc{
+								AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
+									"id":    "2f9f3b84",
+									"value": "hello",
+								}),
+								Status:       states.ObjectReady,
+								Dependencies: make([]addrs.ConfigResource, 0),
+							},
+							ProviderConfigAddr: mustDefaultRootProvider("testing"),
+							Schema:             stacks_testing_provider.TestingResourceSchema,
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("ephemeral"),
+							Value: cty.NullVal(cty.String), // ephemeral
+						},
+						&stackstate.AppliedChangeInputVariable{
+							Addr:  mustStackInputVariable("input"),
+							Value: cty.StringVal("hello"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	for name, tc := range tcs {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+
+			lock := depsfile.NewLocks()
+			lock.SetProvider(
+				addrs.NewDefaultProvider("testing"),
+				providerreqs.MustParseVersion("0.0.0"),
+				providerreqs.MustParseVersionConstraints("=0.0.0"),
+				providerreqs.PreferredHashes([]providerreqs.Hash{}),
+			)
+
+			store := tc.store
+			if store == nil {
+				store = stacks_testing_provider.NewResourceStore()
+			}
+
+			testContext := TestContext{
+				timestamp: &fakePlanTimestamp,
+				config:    loadMainBundleConfigForTest(t, tc.path),
+				providers: map[addrs.Provider]providers.Factory{
+					addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+						provider := stacks_testing_provider.NewProviderWithData(t, store)
+						provider.Authentication = "authn"
+						return provider, nil
+					},
+				},
+				dependencyLocks: *lock,
+			}
+
+			state := tc.state
+			for ix, cycle := range tc.cycles {
+				t.Run(strconv.FormatInt(int64(ix), 10), func(t *testing.T) {
+					var plan *stackplan.Plan
+					t.Run("plan", func(t *testing.T) {
+						plan = testContext.Plan(t, ctx, state, cycle)
+					})
+					t.Run("apply", func(t *testing.T) {
+						state = testContext.Apply(t, ctx, plan, cycle)
+					})
+				})
+			}
+		})
+	}
 }
 
 func TestApplyWithRemovedResource(t *testing.T) {
@@ -508,276 +1871,9 @@ func TestApplyWithSensitivePropagation(t *testing.T) {
 			},
 			InputVariables: make(map[addrs.InputVariable]cty.Value),
 		},
-	}
-
-	sort.SliceStable(applyChanges, func(i, j int) bool {
-		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
-	})
-
-	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
-		t.Errorf("wrong changes\n%s", diff)
-	}
-}
-
-func TestApplyWithCheckableObjects(t *testing.T) {
-	ctx := context.Background()
-	cfg := loadMainBundleConfigForTest(t, "checkable-objects")
-
-	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	store := stacks_testing_provider.NewResourceStore()
-
-	changesCh := make(chan stackplan.PlannedChange)
-	diagsCh := make(chan tfdiags.Diagnostic)
-	lock := depsfile.NewLocks()
-	lock.SetProvider(
-		addrs.NewDefaultProvider("testing"),
-		providerreqs.MustParseVersion("0.0.0"),
-		providerreqs.MustParseVersionConstraints("=0.0.0"),
-		providerreqs.PreferredHashes([]providerreqs.Hash{}),
-	)
-	req := PlanRequest{
-		Config: cfg,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProviderWithData(t, store), nil
-			},
-		},
-		DependencyLocks: *lock,
-
-		ForcePlanTimestamp: &fakePlanTimestamp,
-
-		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
-			stackaddrs.InputVariable{Name: "foo"}: {
-				Value: cty.StringVal("bar"),
-			},
-		},
-	}
-	resp := PlanResponse{
-		PlannedChanges: changesCh,
-		Diagnostics:    diagsCh,
-	}
-	var wantDiags tfdiags.Diagnostics
-	wantDiags = wantDiags.Append(&hcl.Diagnostic{
-		Severity: hcl.DiagWarning,
-
-		Summary: "Check block assertion failed",
-		Detail:  `value must be 'baz'`,
-		Subject: &hcl.Range{
-			Filename: mainBundleSourceAddrStr("checkable-objects/checkable-objects.tf"),
-			Start:    hcl.Pos{Line: 41, Column: 21, Byte: 716},
-			End:      hcl.Pos{Line: 41, Column: 57, Byte: 752},
-		},
-	})
-
-	go Plan(ctx, &req, &resp)
-	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
-
-	if diff := cmp.Diff(wantDiags.ForRPC(), planDiags.ForRPC()); diff != "" {
-		t.Errorf("wrong diagnostics\n%s", diff)
-	}
-
-	planLoader := stackplan.NewLoader()
-	for _, change := range planChanges {
-		proto, err := change.PlannedChangeProto()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		for _, rawMsg := range proto.Raw {
-			err = planLoader.AddRaw(rawMsg)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	plan, err := planLoader.Plan()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	applyReq := ApplyRequest{
-		Config: cfg,
-		Plan:   plan,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProviderWithData(t, store), nil
-			},
-		},
-		DependencyLocks: *lock,
-	}
-
-	applyChangesCh := make(chan stackstate.AppliedChange)
-	diagsCh = make(chan tfdiags.Diagnostic)
-
-	applyResp := ApplyResponse{
-		AppliedChanges: applyChangesCh,
-		Diagnostics:    diagsCh,
-	}
-
-	go Apply(ctx, &applyReq, &applyResp)
-	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
-	if diff := cmp.Diff(wantDiags.ForRPC(), applyDiags.ForRPC()); diff != "" {
-		t.Errorf("wrong diagnostics\n%s", diff)
-	}
-
-	wantChanges := []stackstate.AppliedChange{
-		&stackstate.AppliedChangeComponentInstance{
-			ComponentAddr:         mustAbsComponent("component.single"),
-			ComponentInstanceAddr: mustAbsComponentInstance("component.single"),
-			OutputValues: map[addrs.OutputValue]cty.Value{
-				addrs.OutputValue{Name: "foo"}: cty.StringVal("bar"),
-			},
-			InputVariables: map[addrs.InputVariable]cty.Value{
-				mustInputVariable("foo"): cty.StringVal("bar"),
-			},
-		},
-		&stackstate.AppliedChangeResourceInstanceObject{
-			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.single.testing_resource.main"),
-			NewStateSrc: &states.ResourceInstanceObjectSrc{
-				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
-					"id":    "test",
-					"value": "bar",
-				}),
-				Status:       states.ObjectReady,
-				Dependencies: make([]addrs.ConfigResource, 0),
-			},
-			ProviderConfigAddr: addrs.AbsProviderConfig{
-				Provider: addrs.NewDefaultProvider("testing"),
-			},
-			Schema: stacks_testing_provider.TestingResourceSchema,
-		},
-	}
-
-	sort.SliceStable(applyChanges, func(i, j int) bool {
-		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
-	})
-
-	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
-		t.Errorf("wrong changes\n%s", diff)
-	}
-
-	// capture the state
-	state := make(map[string]*anypb.Any)
-	for _, change := range applyChanges {
-		proto, err := change.AppliedChangeProto()
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, raw := range proto.Raw {
-			state[raw.Key] = raw.Value
-		}
-	}
-	prevState, err := stackstate.LoadFromProto(state)
-	if err != nil {
-		t.Fatalf("failed to load state from proto: %s", err)
-	}
-
-	// We'll follow this up with a destroy plan to verify everything the checks
-	// don't get in the way here.
-
-	changesCh = make(chan stackplan.PlannedChange)
-	diagsCh = make(chan tfdiags.Diagnostic)
-	req = PlanRequest{
-		// For this plan, we're destroying and we now have some state.
-		PlanMode:  plans.DestroyMode,
-		PrevState: prevState,
-
-		// The rest is the same as the previous plan.
-		Config: cfg,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProviderWithData(t, store), nil
-			},
-		},
-		DependencyLocks: *lock,
-
-		ForcePlanTimestamp: &fakePlanTimestamp,
-
-		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
-			stackaddrs.InputVariable{Name: "foo"}: {
-				Value: cty.StringVal("bar"),
-			},
-		},
-	}
-	resp = PlanResponse{
-		PlannedChanges: changesCh,
-		Diagnostics:    diagsCh,
-	}
-
-	go Plan(ctx, &req, &resp)
-	planChanges, planDiags = collectPlanOutput(changesCh, diagsCh)
-
-	if len(planDiags) > 0 {
-		// At this point we shouldn't see the check warning, as they don't
-		// execute during destroy plans.
-		t.Fatalf("expected no diagnostics, got %s", planDiags.ErrWithWarnings())
-	}
-
-	planLoader = stackplan.NewLoader()
-	for _, change := range planChanges {
-		proto, err := change.PlannedChangeProto()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		for _, rawMsg := range proto.Raw {
-			err = planLoader.AddRaw(rawMsg)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	plan, err = planLoader.Plan()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// And now we'll apply the destroy plan to verify that the checks don't
-	// get in the way here.
-
-	applyReq = ApplyRequest{
-		Config: cfg,
-		Plan:   plan,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProviderWithData(t, store), nil
-			},
-		},
-		DependencyLocks: *lock,
-	}
-
-	applyChangesCh = make(chan stackstate.AppliedChange)
-	diagsCh = make(chan tfdiags.Diagnostic)
-
-	applyResp = ApplyResponse{
-		AppliedChanges: applyChangesCh,
-		Diagnostics:    diagsCh,
-	}
-
-	go Apply(ctx, &applyReq, &applyResp)
-	applyChanges, applyDiags = collectApplyOutput(applyChangesCh, diagsCh)
-	if len(applyDiags) > 0 {
-		// Again, the warning from the check block shouldn't be included during
-		// a destroy operation.
-		t.Fatalf("expected no diagnostics, got %s", applyDiags.ErrWithWarnings())
-	}
-
-	wantChanges = []stackstate.AppliedChange{
-		&stackstate.AppliedChangeComponentInstance{
-			ComponentAddr:         mustAbsComponent("component.single"),
-			ComponentInstanceAddr: mustAbsComponentInstance("component.single"),
-			OutputValues:          make(map[addrs.OutputValue]cty.Value),
-			InputVariables: map[addrs.InputVariable]cty.Value{
-				mustInputVariable("foo"): cty.StringVal("bar"),
-			},
-		},
-		&stackstate.AppliedChangeResourceInstanceObject{
-			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.single.testing_resource.main"),
-			ProviderConfigAddr:         mustDefaultRootProvider("testing"),
+		&stackstate.AppliedChangeInputVariable{
+			Addr:  mustStackInputVariable("id"),
+			Value: cty.StringVal("bb5cf32312ec"),
 		},
 	}
 
@@ -823,10 +1919,7 @@ func TestApplyWithForcePlanTimestamp(t *testing.T) {
 	}
 	// Sanity check that the plan timestamp was set correctly
 	output := expectOutput(t, "plantimestamp", planChanges)
-	plantimestampValue, err := output.NewValue.Decode(cty.String)
-	if err != nil {
-		t.Fatal(err)
-	}
+	plantimestampValue := output.After
 
 	if plantimestampValue.AsString() != forcedPlanTimestamp {
 		t.Errorf("expected plantimestamp to be %q, got %q", forcedPlanTimestamp, plantimestampValue.AsString())
@@ -902,6 +1995,10 @@ func TestApplyWithForcePlanTimestamp(t *testing.T) {
 				mustInputVariable("value"): cty.StringVal(forcedPlanTimestamp),
 			},
 		},
+		&stackstate.AppliedChangeOutputValue{
+			Addr:  stackaddrs.OutputValue{Name: "plantimestamp"},
+			Value: cty.StringVal(forcedPlanTimestamp),
+		},
 	}
 
 	sort.SliceStable(applyChanges, func(i, j int) bool {
@@ -945,10 +2042,7 @@ func TestApplyWithDefaultPlanTimestamp(t *testing.T) {
 	}
 	// Sanity check that the plan timestamp was set correctly
 	output := expectOutput(t, "plantimestamp", planChanges)
-	plantimestampValue, err := output.NewValue.Decode(cty.String)
-	if err != nil {
-		t.Fatal(err)
-	}
+	plantimestampValue := output.After
 
 	plantimestamp, err := time.Parse(time.RFC3339, plantimestampValue.AsString())
 	if err != nil {
@@ -1445,6 +2539,10 @@ func TestApplyWithStateManipulation(t *testing.T) {
 					ProviderConfigAddr: mustDefaultRootProvider("testing"),
 					Schema:             stacks_testing_provider.TestingResourceSchema,
 				},
+				&stackstate.AppliedChangeInputVariable{
+					Addr:  mustStackInputVariable("id"),
+					Value: cty.StringVal("imported"),
+				},
 			},
 			counts: collections.NewMap[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange](
 				collections.MapElem[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange]{
@@ -1500,6 +2598,10 @@ func TestApplyWithStateManipulation(t *testing.T) {
 					},
 					ProviderConfigAddr: mustDefaultRootProvider("testing"),
 					Schema:             stacks_testing_provider.TestingResourceSchema,
+				},
+				&stackstate.AppliedChangeInputVariable{
+					Addr:  mustStackInputVariable("id"),
+					Value: cty.StringVal("imported"),
 				},
 			},
 			counts: collections.NewMap[stackaddrs.AbsComponentInstance, *hooks.ComponentInstanceChange](
@@ -1762,24 +2864,24 @@ func TestApplyWithStateManipulation(t *testing.T) {
 			}
 
 			wantCounts := tc.counts
-			for _, elem := range wantCounts.Elems() {
+			for key, elem := range wantCounts.All() {
 				// First, make sure everything we wanted is present.
-				if !gotCounts.HasKey(elem.K) {
-					t.Errorf("wrong counts: wanted %s but didn't get it", elem.K)
+				if !gotCounts.HasKey(key) {
+					t.Errorf("wrong counts: wanted %s but didn't get it", key)
 				}
 
 				// And that the values actually match.
-				got, want := gotCounts.Get(elem.K), elem.V
+				got, want := gotCounts.Get(key), elem
 				if diff := cmp.Diff(want, got); diff != "" {
 					t.Errorf("wrong counts for %s: %s", want.Addr, diff)
 				}
 
 			}
 
-			for _, elem := range gotCounts.Elems() {
+			for key := range gotCounts.All() {
 				// Then, make sure we didn't get anything we didn't want.
-				if !wantCounts.HasKey(elem.K) {
-					t.Errorf("wrong counts: got %s but didn't want it", elem.K)
+				if !wantCounts.HasKey(key) {
+					t.Errorf("wrong counts: got %s but didn't want it", key)
 				}
 			}
 		})
@@ -1898,6 +3000,10 @@ func TestApplyWithChangedInputValues(t *testing.T) {
 			ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
 			OutputValues:          make(map[addrs.OutputValue]cty.Value),
 			InputVariables:        make(map[addrs.InputVariable]cty.Value),
+		},
+		&stackstate.AppliedChangeInputVariable{
+			Addr:  mustStackInputVariable("id"),
+			Value: cty.NullVal(cty.String),
 		},
 		// no resources should have been created because the input variable was
 		// invalid.
@@ -2069,419 +3175,12 @@ func TestApplyAutomaticInputConversion(t *testing.T) {
 			ProviderConfigAddr: mustDefaultRootProvider("testing"),
 			Schema:             stacks_testing_provider.TestingResourceSchema,
 		},
-	}
-
-	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
-		t.Errorf("wrong changes\n%s", diff)
-	}
-}
-
-func TestApplyEphemeralInput(t *testing.T) {
-	ctx := context.Background()
-	cfg := loadMainBundleConfigForTest(t, filepath.Join("with-single-input", "ephemeral"))
-
-	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	changesCh := make(chan stackplan.PlannedChange)
-	diagsCh := make(chan tfdiags.Diagnostic)
-	lock := depsfile.NewLocks()
-	lock.SetProvider(
-		addrs.NewDefaultProvider("testing"),
-		providerreqs.MustParseVersion("0.0.0"),
-		providerreqs.MustParseVersionConstraints("=0.0.0"),
-		providerreqs.PreferredHashes([]providerreqs.Hash{}),
-	)
-	req := PlanRequest{
-		Config: cfg,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProvider(t), nil
-			},
-		},
-		DependencyLocks: *lock,
-
-		ForcePlanTimestamp: &fakePlanTimestamp,
-
-		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
-			stackaddrs.InputVariable{Name: "input"}: {
-				Value: cty.StringVal("hello"),
-			},
-			stackaddrs.InputVariable{Name: "ephemeral"}: {
-				Value: cty.StringVal("ephemeral"),
-			},
-		},
-	}
-
-	resp := PlanResponse{
-		PlannedChanges: changesCh,
-		Diagnostics:    diagsCh,
-	}
-
-	go Plan(ctx, &req, &resp)
-	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
-	if len(planDiags) > 0 {
-		t.Fatalf("expected no diagnostics, got %s", planDiags.ErrWithWarnings())
-	}
-
-	planLoader := stackplan.NewLoader()
-	for _, change := range planChanges {
-		proto, err := change.PlannedChangeProto()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		for _, rawMsg := range proto.Raw {
-			err = planLoader.AddRaw(rawMsg)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	plan, err := planLoader.Plan()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	applyReq := ApplyRequest{
-		Config: cfg,
-		Plan:   plan,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProvider(t), nil
-			},
-		},
-		DependencyLocks: *lock,
-		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
-			stackaddrs.InputVariable{Name: "input"}: {
-				Value: cty.StringVal("hello"),
-			},
-			stackaddrs.InputVariable{Name: "ephemeral"}: {
-				// This has changed, and that should be okay.
-				Value: cty.StringVal("applying"),
-			},
-		},
-	}
-
-	applyChangesCh := make(chan stackstate.AppliedChange)
-	diagsCh = make(chan tfdiags.Diagnostic)
-
-	applyResp := ApplyResponse{
-		AppliedChanges: applyChangesCh,
-		Diagnostics:    diagsCh,
-	}
-
-	go Apply(ctx, &applyReq, &applyResp)
-	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
-	if len(applyDiags) > 0 {
-		t.Fatalf("expected no diagnostics, got %s", applyDiags.ErrWithWarnings())
-	}
-
-	sort.SliceStable(applyChanges, func(i, j int) bool {
-		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
-	})
-
-	wantChanges := []stackstate.AppliedChange{
-		&stackstate.AppliedChangeComponentInstance{
-			ComponentAddr:         mustAbsComponent("component.self"),
-			ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
-			OutputValues:          make(map[addrs.OutputValue]cty.Value),
-			InputVariables: map[addrs.InputVariable]cty.Value{
-				mustInputVariable("id"):    cty.StringVal("2f9f3b84"),
-				mustInputVariable("input"): cty.StringVal("hello"),
-			},
-		},
-		&stackstate.AppliedChangeResourceInstanceObject{
-			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
-			NewStateSrc: &states.ResourceInstanceObjectSrc{
-				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
-					"id":    "2f9f3b84",
-					"value": "hello",
-				}),
-				Status:       states.ObjectReady,
-				Dependencies: make([]addrs.ConfigResource, 0),
-			},
-			ProviderConfigAddr: mustDefaultRootProvider("testing"),
-			Schema:             stacks_testing_provider.TestingResourceSchema,
-		},
-	}
-
-	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
-		t.Errorf("wrong changes\n%s", diff)
-	}
-}
-
-func TestApplyMissingEphemeralInput(t *testing.T) {
-	ctx := context.Background()
-	cfg := loadMainBundleConfigForTest(t, filepath.Join("with-single-input", "ephemeral"))
-
-	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	changesCh := make(chan stackplan.PlannedChange)
-	diagsCh := make(chan tfdiags.Diagnostic)
-	lock := depsfile.NewLocks()
-	lock.SetProvider(
-		addrs.NewDefaultProvider("testing"),
-		providerreqs.MustParseVersion("0.0.0"),
-		providerreqs.MustParseVersionConstraints("=0.0.0"),
-		providerreqs.PreferredHashes([]providerreqs.Hash{}),
-	)
-	req := PlanRequest{
-		Config: cfg,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProvider(t), nil
-			},
-		},
-		DependencyLocks: *lock,
-
-		ForcePlanTimestamp: &fakePlanTimestamp,
-
-		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
-			stackaddrs.InputVariable{Name: "input"}: {
-				Value: cty.StringVal("hello"),
-			},
-			stackaddrs.InputVariable{Name: "ephemeral"}: {
-				Value: cty.StringVal("ephemeral"),
-			},
-		},
-	}
-
-	resp := PlanResponse{
-		PlannedChanges: changesCh,
-		Diagnostics:    diagsCh,
-	}
-
-	go Plan(ctx, &req, &resp)
-	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
-	if len(planDiags) > 0 {
-		t.Fatalf("expected no diagnostics, got %s", planDiags.ErrWithWarnings())
-	}
-
-	planLoader := stackplan.NewLoader()
-	for _, change := range planChanges {
-		proto, err := change.PlannedChangeProto()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		for _, rawMsg := range proto.Raw {
-			err = planLoader.AddRaw(rawMsg)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	plan, err := planLoader.Plan()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	applyReq := ApplyRequest{
-		Config: cfg,
-		Plan:   plan,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProvider(t), nil
-			},
-		},
-		DependencyLocks: *lock,
-		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
-			stackaddrs.InputVariable{Name: "input"}: {
-				Value: cty.StringVal("hello"),
-			},
-		},
-	}
-
-	applyChangesCh := make(chan stackstate.AppliedChange)
-	diagsCh = make(chan tfdiags.Diagnostic)
-
-	applyResp := ApplyResponse{
-		AppliedChanges: applyChangesCh,
-		Diagnostics:    diagsCh,
-	}
-
-	go Apply(ctx, &applyReq, &applyResp)
-	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
-	if len(applyDiags) != 1 {
-		t.Fatalf("expected exactly 1 diagnostic, got %s", applyDiags.ErrWithWarnings())
-	}
-
-	gotSeverity, wantSeverity := applyDiags[0].Severity(), tfdiags.Error
-	gotSummary, wantSummary := applyDiags[0].Description().Summary, "No value for required variable"
-	gotDetail, wantDetail := applyDiags[0].Description().Detail, "The root input variable \"var.ephemeral\" is not set, and has no default value."
-
-	if gotSeverity != wantSeverity {
-		t.Errorf("expected severity %q, got %q", wantSeverity, gotSeverity)
-	}
-	if gotSummary != wantSummary {
-		t.Errorf("expected summary %q, got %q", wantSummary, gotSummary)
-	}
-	if gotDetail != wantDetail {
-		t.Errorf("expected detail %q, got %q", wantDetail, gotDetail)
-	}
-
-	sort.SliceStable(applyChanges, func(i, j int) bool {
-		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
-	})
-
-	wantChanges := []stackstate.AppliedChange{
-		&stackstate.AppliedChangeComponentInstance{
-			ComponentAddr:         mustAbsComponent("component.self"),
-			ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
-			OutputValues:          make(map[addrs.OutputValue]cty.Value),
-			InputVariables: map[addrs.InputVariable]cty.Value{
-				mustInputVariable("id"):    cty.StringVal("2f9f3b84"),
-				mustInputVariable("input"): cty.StringVal("hello"),
-			},
-		},
-		&stackstate.AppliedChangeResourceInstanceObject{
-			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
-			NewStateSrc: &states.ResourceInstanceObjectSrc{
-				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
-					"id":    "2f9f3b84",
-					"value": "hello",
-				}),
-				Status:       states.ObjectReady,
-				Dependencies: make([]addrs.ConfigResource, 0),
-			},
-			ProviderConfigAddr: mustDefaultRootProvider("testing"),
-			Schema:             stacks_testing_provider.TestingResourceSchema,
-		},
-	}
-
-	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
-		t.Errorf("wrong changes\n%s", diff)
-	}
-}
-
-func TestApplyEphemeralInputWithDefault(t *testing.T) {
-	ctx := context.Background()
-	cfg := loadMainBundleConfigForTest(t, filepath.Join("with-single-input", "ephemeral-default"))
-
-	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	changesCh := make(chan stackplan.PlannedChange)
-	diagsCh := make(chan tfdiags.Diagnostic)
-	lock := depsfile.NewLocks()
-	lock.SetProvider(
-		addrs.NewDefaultProvider("testing"),
-		providerreqs.MustParseVersion("0.0.0"),
-		providerreqs.MustParseVersionConstraints("=0.0.0"),
-		providerreqs.PreferredHashes([]providerreqs.Hash{}),
-	)
-	req := PlanRequest{
-		Config: cfg,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProvider(t), nil
-			},
-		},
-		DependencyLocks: *lock,
-
-		ForcePlanTimestamp: &fakePlanTimestamp,
-
-		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
-			stackaddrs.InputVariable{Name: "input"}: {
-				Value: cty.StringVal("hello"),
-			},
-		},
-	}
-
-	resp := PlanResponse{
-		PlannedChanges: changesCh,
-		Diagnostics:    diagsCh,
-	}
-
-	go Plan(ctx, &req, &resp)
-	planChanges, planDiags := collectPlanOutput(changesCh, diagsCh)
-	if len(planDiags) > 0 {
-		t.Fatalf("expected no diagnostics, got %s", planDiags.ErrWithWarnings())
-	}
-
-	planLoader := stackplan.NewLoader()
-	for _, change := range planChanges {
-		proto, err := change.PlannedChangeProto()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		for _, rawMsg := range proto.Raw {
-			err = planLoader.AddRaw(rawMsg)
-			if err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	plan, err := planLoader.Plan()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	applyReq := ApplyRequest{
-		Config: cfg,
-		Plan:   plan,
-		ProviderFactories: map[addrs.Provider]providers.Factory{
-			addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-				return stacks_testing_provider.NewProvider(t), nil
-			},
-		},
-		DependencyLocks: *lock,
-		InputValues: map[stackaddrs.InputVariable]ExternalInputValue{
-			stackaddrs.InputVariable{Name: "input"}: {
-				Value: cty.StringVal("hello"),
-			},
-		},
-	}
-
-	applyChangesCh := make(chan stackstate.AppliedChange)
-	diagsCh = make(chan tfdiags.Diagnostic)
-
-	applyResp := ApplyResponse{
-		AppliedChanges: applyChangesCh,
-		Diagnostics:    diagsCh,
-	}
-
-	go Apply(ctx, &applyReq, &applyResp)
-	applyChanges, applyDiags := collectApplyOutput(applyChangesCh, diagsCh)
-	if len(applyDiags) > 0 {
-		t.Fatalf("expected no diagnostics, got %s", applyDiags.ErrWithWarnings())
-	}
-
-	sort.SliceStable(applyChanges, func(i, j int) bool {
-		return appliedChangeSortKey(applyChanges[i]) < appliedChangeSortKey(applyChanges[j])
-	})
-
-	wantChanges := []stackstate.AppliedChange{
-		&stackstate.AppliedChangeComponentInstance{
-			ComponentAddr:         mustAbsComponent("component.self"),
-			ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
-			OutputValues:          make(map[addrs.OutputValue]cty.Value),
-			InputVariables: map[addrs.InputVariable]cty.Value{
-				mustInputVariable("id"):    cty.StringVal("2f9f3b84"),
-				mustInputVariable("input"): cty.StringVal("hello"),
-			},
-		},
-		&stackstate.AppliedChangeResourceInstanceObject{
-			ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
-			NewStateSrc: &states.ResourceInstanceObjectSrc{
-				AttrsJSON: mustMarshalJSONAttrs(map[string]interface{}{
-					"id":    "2f9f3b84",
-					"value": "hello",
-				}),
-				Status:       states.ObjectReady,
-				Dependencies: make([]addrs.ConfigResource, 0),
-			},
-			ProviderConfigAddr: mustDefaultRootProvider("testing"),
-			Schema:             stacks_testing_provider.TestingResourceSchema,
+		&stackstate.AppliedChangeInputVariable{
+			Addr: mustStackInputVariable("input"),
+			Value: cty.MapVal(map[string]cty.Value{
+				"hello": cty.StringVal("hello"),
+				"world": cty.StringVal("world"),
+			}),
 		},
 	}
 
@@ -2702,17 +3401,19 @@ func TestApply_WithProviderFunctions(t *testing.T) {
 			TerraformVersion: version.SemVer,
 		},
 		&stackplan.PlannedChangeOutputValue{
-			Addr:     stackaddrs.OutputValue{Name: "value"},
-			Action:   plans.Create,
-			OldValue: mustPlanDynamicValue(cty.NullVal(cty.String)),
-			NewValue: mustPlanDynamicValue(cty.StringVal("hello, world!")),
+			Addr:   stackaddrs.OutputValue{Name: "value"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.StringVal("hello, world!"),
 		},
 		&stackplan.PlannedChangePlannedTimestamp{
 			PlannedTimestamp: fakePlanTimestamp,
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "input"},
-			Value: cty.StringVal("hello, world!"),
+			Addr:   stackaddrs.InputVariable{Name: "input"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.StringVal("hello, world!"),
 		},
 	}
 	if diff := cmp.Diff(wantPlanChanges, planChanges, ctydebug.CmpOptions, cmpCollectionsSet); diff != "" {
@@ -2803,6 +3504,14 @@ func TestApply_WithProviderFunctions(t *testing.T) {
 			},
 			ProviderConfigAddr: mustDefaultRootProvider("testing"),
 			Schema:             stacks_testing_provider.TestingResourceSchema,
+		},
+		&stackstate.AppliedChangeOutputValue{
+			Addr:  stackaddrs.OutputValue{Name: "value"},
+			Value: cty.StringVal("hello, world!"),
+		},
+		&stackstate.AppliedChangeInputVariable{
+			Addr:  mustStackInputVariable("input"),
+			Value: cty.StringVal("hello, world!"),
 		},
 	}
 
@@ -2960,6 +3669,14 @@ func TestApplyFailedDependencyWithResourceInState(t *testing.T) {
 				Dependencies:       []addrs.ConfigResource{mustAbsResourceInstance("testing_failed_resource.data").ConfigResource()},
 			},
 			Schema: stacks_testing_provider.TestingResourceSchema,
+		},
+		&stackstate.AppliedChangeInputVariable{
+			Addr:  mustStackInputVariable("fail_apply"),
+			Value: cty.True,
+		},
+		&stackstate.AppliedChangeInputVariable{
+			Addr:  mustStackInputVariable("fail_plan"),
+			Value: cty.False,
 		},
 	}
 
@@ -3121,6 +3838,14 @@ func TestApplyManuallyRemovedResource(t *testing.T) {
 			NewStateSrc:                nil, // We should be removing this from the state file.
 			Schema:                     nil,
 		},
+		&stackstate.AppliedChangeInputVariable{
+			Addr:  mustStackInputVariable("id"),
+			Value: cty.StringVal("foo"),
+		},
+		&stackstate.AppliedChangeInputVariable{
+			Addr:  mustStackInputVariable("input"),
+			Value: cty.StringVal("hello"),
+		},
 	}
 
 	sort.SliceStable(applyChanges, func(i, j int) bool {
@@ -3130,520 +3855,6 @@ func TestApplyManuallyRemovedResource(t *testing.T) {
 	if diff := cmp.Diff(wantChanges, applyChanges, changesCmpOpts); diff != "" {
 		t.Errorf("wrong changes\n%s", diff)
 	}
-}
-
-func TestApply_RemovedBlocks(t *testing.T) {
-	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	lock := depsfile.NewLocks()
-	lock.SetProvider(
-		addrs.NewDefaultProvider("testing"),
-		providerreqs.MustParseVersion("0.0.0"),
-		providerreqs.MustParseVersionConstraints("=0.0.0"),
-		providerreqs.PreferredHashes([]providerreqs.Hash{}),
-	)
-
-	// TODO: Add tests for and implement the following cases:
-	//   - Add a test for a removed block that forgets instead of destroys.
-
-	tcs := map[string]struct {
-		source           string
-		initialState     *stackstate.State
-		store            *stacks_testing_provider.ResourceStore
-		inputs           map[string]cty.Value
-		wantPlanChanges  []stackplan.PlannedChange
-		wantPlanDiags    []expectedDiagnostic
-		wantApplyChanges []stackstate.AppliedChange
-		wantApplyDiags   []expectedDiagnostic
-	}{
-		"removed component": {
-			source: filepath.Join("with-single-input", "removed-component"),
-			initialState: stackstate.NewStateBuilder().
-				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.self")).
-					AddInputVariable("id", cty.StringVal("removed")).
-					AddInputVariable("input", cty.StringVal("removed"))).
-				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
-					SetAddr(mustAbsResourceInstanceObject("component.self.testing_resource.data")).
-					SetProviderAddr(mustDefaultRootProvider("testing")).
-					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
-						Status: states.ObjectReady,
-						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
-							"id":    "removed",
-							"value": "removed",
-						}),
-					})).
-				Build(),
-			store: stacks_testing_provider.NewResourceStoreBuilder().
-				AddResource("removed", cty.ObjectVal(map[string]cty.Value{
-					"id":    cty.StringVal("removed"),
-					"value": cty.StringVal("removed"),
-				})).
-				Build(),
-			inputs: map[string]cty.Value{},
-			wantPlanChanges: []stackplan.PlannedChange{
-				&stackplan.PlannedChangeApplyable{
-					Applyable: true,
-				},
-				&stackplan.PlannedChangeComponentInstance{
-					Addr:          mustAbsComponentInstance("component.self"),
-					PlanComplete:  true,
-					PlanApplyable: true,
-					Mode:          plans.DestroyMode,
-					Action:        plans.Delete,
-					PlannedInputValues: map[string]plans.DynamicValue{
-						"id":    mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
-						"input": mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
-					},
-					PlannedInputValueMarks: map[string][]cty.PathValueMarks{
-						"input": nil,
-						"id":    nil,
-					},
-					PlannedOutputValues: make(map[string]cty.Value),
-					PlannedCheckResults: &states.CheckResults{},
-					PlanTimestamp:       fakePlanTimestamp,
-				},
-				&stackplan.PlannedChangeResourceInstancePlanned{
-					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
-					ChangeSrc: &plans.ResourceInstanceChangeSrc{
-						Addr:        mustAbsResourceInstance("testing_resource.data"),
-						PrevRunAddr: mustAbsResourceInstance("testing_resource.data"),
-						ChangeSrc: plans.ChangeSrc{
-							Action: plans.Delete,
-							Before: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
-								"id":    cty.StringVal("removed"),
-								"value": cty.StringVal("removed"),
-							})),
-							After: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
-								"id":    cty.String,
-								"value": cty.String,
-							}))),
-						},
-						ProviderAddr: mustDefaultRootProvider("testing"),
-					},
-					PriorStateSrc: &states.ResourceInstanceObjectSrc{
-						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
-							"id":    "removed",
-							"value": "removed",
-						}),
-						Dependencies: make([]addrs.ConfigResource, 0),
-						Status:       states.ObjectReady,
-					},
-					ProviderConfigAddr: mustDefaultRootProvider("testing"),
-					Schema:             stacks_testing_provider.TestingResourceSchema,
-				},
-				&stackplan.PlannedChangeHeader{
-					TerraformVersion: version.SemVer,
-				},
-				&stackplan.PlannedChangePlannedTimestamp{
-					PlannedTimestamp: fakePlanTimestamp,
-				},
-			},
-			wantPlanDiags: []expectedDiagnostic{},
-			wantApplyChanges: []stackstate.AppliedChange{
-				&stackstate.AppliedChangeComponentInstance{
-					ComponentAddr:         mustAbsComponent("component.self"),
-					ComponentInstanceAddr: mustAbsComponentInstance("component.self"),
-					OutputValues:          make(map[addrs.OutputValue]cty.Value),
-					InputVariables: map[addrs.InputVariable]cty.Value{
-						mustInputVariable("id"):    cty.StringVal("removed"),
-						mustInputVariable("input"): cty.StringVal("removed"),
-					},
-				},
-				&stackstate.AppliedChangeResourceInstanceObject{
-					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self.testing_resource.data"),
-					ProviderConfigAddr:         mustDefaultRootProvider("testing"),
-					NewStateSrc:                nil,
-					Schema:                     nil,
-				},
-			},
-			wantApplyDiags: []expectedDiagnostic{},
-		},
-		"removed component instance": {
-			source: filepath.Join("with-single-input", "removed-component-instance"),
-			initialState: stackstate.NewStateBuilder().
-				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("component.self[\"removed\"]")).
-					AddInputVariable("id", cty.StringVal("removed")).
-					AddInputVariable("input", cty.StringVal("removed"))).
-				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
-					SetAddr(mustAbsResourceInstanceObject("component.self[\"removed\"].testing_resource.data")).
-					SetProviderAddr(mustDefaultRootProvider("testing")).
-					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
-						Status: states.ObjectReady,
-						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
-							"id":    "removed",
-							"value": "removed",
-						}),
-					})).
-				Build(),
-			store: stacks_testing_provider.NewResourceStoreBuilder().
-				AddResource("removed", cty.ObjectVal(map[string]cty.Value{
-					"id":    cty.StringVal("removed"),
-					"value": cty.StringVal("removed"),
-				})).
-				Build(),
-			inputs: map[string]cty.Value{
-				"input": cty.SetVal([]cty.Value{
-					cty.StringVal("added"),
-				}),
-				"removed": cty.SetVal([]cty.Value{
-					cty.StringVal("removed"),
-				}),
-			},
-			wantPlanChanges: []stackplan.PlannedChange{
-				&stackplan.PlannedChangeApplyable{
-					Applyable: true,
-				},
-				// we're expecting the new component to be created
-				&stackplan.PlannedChangeComponentInstance{
-					Addr:          mustAbsComponentInstance("component.self[\"added\"]"),
-					PlanComplete:  true,
-					PlanApplyable: true,
-					Action:        plans.Create,
-					PlannedInputValues: map[string]plans.DynamicValue{
-						"id":    mustPlanDynamicValueDynamicType(cty.StringVal("added")),
-						"input": mustPlanDynamicValueDynamicType(cty.StringVal("added")),
-					},
-					PlannedInputValueMarks: map[string][]cty.PathValueMarks{
-						"input": nil,
-						"id":    nil,
-					},
-					PlannedOutputValues: make(map[string]cty.Value),
-					PlannedCheckResults: &states.CheckResults{},
-					PlanTimestamp:       fakePlanTimestamp,
-				},
-				&stackplan.PlannedChangeResourceInstancePlanned{
-					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"added\"].testing_resource.data"),
-					ChangeSrc: &plans.ResourceInstanceChangeSrc{
-						Addr:        mustAbsResourceInstance("testing_resource.data"),
-						PrevRunAddr: mustAbsResourceInstance("testing_resource.data"),
-						ChangeSrc: plans.ChangeSrc{
-							Action: plans.Create,
-							Before: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
-								"id":    cty.String,
-								"value": cty.String,
-							}))),
-							After: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
-								"id":    cty.StringVal("added"),
-								"value": cty.StringVal("added"),
-							})),
-						},
-						ProviderAddr: mustDefaultRootProvider("testing"),
-					},
-					ProviderConfigAddr: mustDefaultRootProvider("testing"),
-					Schema:             stacks_testing_provider.TestingResourceSchema,
-				},
-				&stackplan.PlannedChangeComponentInstance{
-					Addr:          mustAbsComponentInstance("component.self[\"removed\"]"),
-					PlanComplete:  true,
-					PlanApplyable: true,
-					Mode:          plans.DestroyMode,
-					Action:        plans.Delete,
-					PlannedInputValues: map[string]plans.DynamicValue{
-						"id":    mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
-						"input": mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
-					},
-					PlannedInputValueMarks: map[string][]cty.PathValueMarks{
-						"input": nil,
-						"id":    nil,
-					},
-					PlannedOutputValues: make(map[string]cty.Value),
-					PlannedCheckResults: &states.CheckResults{},
-					PlanTimestamp:       fakePlanTimestamp,
-				},
-				&stackplan.PlannedChangeResourceInstancePlanned{
-					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"removed\"].testing_resource.data"),
-					ChangeSrc: &plans.ResourceInstanceChangeSrc{
-						Addr:        mustAbsResourceInstance("testing_resource.data"),
-						PrevRunAddr: mustAbsResourceInstance("testing_resource.data"),
-						ChangeSrc: plans.ChangeSrc{
-							Action: plans.Delete,
-							Before: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
-								"id":    cty.StringVal("removed"),
-								"value": cty.StringVal("removed"),
-							})),
-							After: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
-								"id":    cty.String,
-								"value": cty.String,
-							}))),
-						},
-						ProviderAddr: mustDefaultRootProvider("testing"),
-					},
-					PriorStateSrc: &states.ResourceInstanceObjectSrc{
-						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
-							"id":    "removed",
-							"value": "removed",
-						}),
-						Dependencies: make([]addrs.ConfigResource, 0),
-						Status:       states.ObjectReady,
-					},
-					ProviderConfigAddr: mustDefaultRootProvider("testing"),
-					Schema:             stacks_testing_provider.TestingResourceSchema,
-				},
-				&stackplan.PlannedChangeHeader{
-					TerraformVersion: version.SemVer,
-				},
-				&stackplan.PlannedChangePlannedTimestamp{
-					PlannedTimestamp: fakePlanTimestamp,
-				},
-				&stackplan.PlannedChangeRootInputValue{
-					Addr: stackaddrs.InputVariable{Name: "input"},
-					Value: cty.SetVal([]cty.Value{
-						cty.StringVal("added"),
-					}),
-				},
-				&stackplan.PlannedChangeRootInputValue{
-					Addr: stackaddrs.InputVariable{Name: "removed"},
-					Value: cty.SetVal([]cty.Value{
-						cty.StringVal("removed"),
-					}),
-				},
-			},
-			wantPlanDiags: []expectedDiagnostic{},
-			wantApplyChanges: []stackstate.AppliedChange{
-				&stackstate.AppliedChangeComponentInstance{
-					ComponentAddr:         mustAbsComponent("component.self"),
-					ComponentInstanceAddr: mustAbsComponentInstance("component.self[\"added\"]"),
-					OutputValues:          make(map[addrs.OutputValue]cty.Value),
-					InputVariables: map[addrs.InputVariable]cty.Value{
-						mustInputVariable("id"):    cty.StringVal("added"),
-						mustInputVariable("input"): cty.StringVal("added"),
-					},
-				},
-				&stackstate.AppliedChangeResourceInstanceObject{
-					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"added\"].testing_resource.data"),
-					NewStateSrc: &states.ResourceInstanceObjectSrc{
-						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
-							"id":    "added",
-							"value": "added",
-						}),
-						Status:       states.ObjectReady,
-						Dependencies: make([]addrs.ConfigResource, 0),
-					},
-					ProviderConfigAddr: mustDefaultRootProvider("testing"),
-					Schema:             stacks_testing_provider.TestingResourceSchema,
-				},
-				&stackstate.AppliedChangeComponentInstance{
-					ComponentAddr:         mustAbsComponent("component.self"),
-					ComponentInstanceAddr: mustAbsComponentInstance("component.self[\"removed\"]"),
-					OutputValues:          make(map[addrs.OutputValue]cty.Value),
-					InputVariables: map[addrs.InputVariable]cty.Value{
-						mustInputVariable("id"):    cty.StringVal("removed"),
-						mustInputVariable("input"): cty.StringVal("removed"),
-					},
-				},
-				&stackstate.AppliedChangeResourceInstanceObject{
-					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("component.self[\"removed\"].testing_resource.data"),
-					ProviderConfigAddr:         mustDefaultRootProvider("testing"),
-					NewStateSrc:                nil,
-					Schema:                     nil,
-				},
-			},
-			wantApplyDiags: []expectedDiagnostic{},
-		},
-		"removed embedded component": {
-			source: filepath.Join("with-single-input", "removed-embedded-component"),
-			initialState: stackstate.NewStateBuilder().
-				AddComponentInstance(stackstate.NewComponentInstanceBuilder(mustAbsComponentInstance("stack.a.component.self")).
-					AddInputVariable("id", cty.StringVal("removed")).
-					AddInputVariable("input", cty.StringVal("removed"))).
-				AddResourceInstance(stackstate.NewResourceInstanceBuilder().
-					SetAddr(mustAbsResourceInstanceObject("stack.a.component.self.testing_resource.data")).
-					SetProviderAddr(mustDefaultRootProvider("testing")).
-					SetResourceInstanceObjectSrc(states.ResourceInstanceObjectSrc{
-						Status: states.ObjectReady,
-						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
-							"id":    "removed",
-							"value": "removed",
-						}),
-					})).
-				Build(),
-			store: stacks_testing_provider.NewResourceStoreBuilder().
-				AddResource("removed", cty.ObjectVal(map[string]cty.Value{
-					"id":    cty.StringVal("removed"),
-					"value": cty.StringVal("removed"),
-				})).
-				Build(),
-			inputs: map[string]cty.Value{},
-			wantPlanChanges: []stackplan.PlannedChange{
-				&stackplan.PlannedChangeApplyable{
-					Applyable: true,
-				},
-				&stackplan.PlannedChangeHeader{
-					TerraformVersion: version.SemVer,
-				},
-				&stackplan.PlannedChangePlannedTimestamp{
-					PlannedTimestamp: fakePlanTimestamp,
-				},
-				&stackplan.PlannedChangeComponentInstance{
-					Addr:          mustAbsComponentInstance("stack.a.component.self"),
-					PlanComplete:  true,
-					PlanApplyable: true,
-					Mode:          plans.DestroyMode,
-					Action:        plans.Delete,
-					PlannedInputValues: map[string]plans.DynamicValue{
-						"id":    mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
-						"input": mustPlanDynamicValueDynamicType(cty.StringVal("removed")),
-					},
-					PlannedInputValueMarks: map[string][]cty.PathValueMarks{
-						"input": nil,
-						"id":    nil,
-					},
-					PlannedOutputValues: make(map[string]cty.Value),
-					PlannedCheckResults: &states.CheckResults{},
-					PlanTimestamp:       fakePlanTimestamp,
-				},
-				&stackplan.PlannedChangeResourceInstancePlanned{
-					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("stack.a.component.self.testing_resource.data"),
-					ChangeSrc: &plans.ResourceInstanceChangeSrc{
-						Addr:        mustAbsResourceInstance("testing_resource.data"),
-						PrevRunAddr: mustAbsResourceInstance("testing_resource.data"),
-						ChangeSrc: plans.ChangeSrc{
-							Action: plans.Delete,
-							Before: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
-								"id":    cty.StringVal("removed"),
-								"value": cty.StringVal("removed"),
-							})),
-							After: mustPlanDynamicValue(cty.NullVal(cty.Object(map[string]cty.Type{
-								"id":    cty.String,
-								"value": cty.String,
-							}))),
-						},
-						ProviderAddr: mustDefaultRootProvider("testing"),
-					},
-					PriorStateSrc: &states.ResourceInstanceObjectSrc{
-						AttrsJSON: mustMarshalJSONAttrs(map[string]any{
-							"id":    "removed",
-							"value": "removed",
-						}),
-						Dependencies: make([]addrs.ConfigResource, 0),
-						Status:       states.ObjectReady,
-					},
-					ProviderConfigAddr: mustDefaultRootProvider("testing"),
-					Schema:             stacks_testing_provider.TestingResourceSchema,
-				},
-			},
-			wantPlanDiags: []expectedDiagnostic{},
-			wantApplyChanges: []stackstate.AppliedChange{
-				&stackstate.AppliedChangeComponentInstance{
-					ComponentAddr:         mustAbsComponent("stack.a.component.self"),
-					ComponentInstanceAddr: mustAbsComponentInstance("stack.a.component.self"),
-					OutputValues:          make(map[addrs.OutputValue]cty.Value),
-					InputVariables: map[addrs.InputVariable]cty.Value{
-						mustInputVariable("id"):    cty.StringVal("removed"),
-						mustInputVariable("input"): cty.StringVal("removed"),
-					},
-				},
-				&stackstate.AppliedChangeResourceInstanceObject{
-					ResourceInstanceObjectAddr: mustAbsResourceInstanceObject("stack.a.component.self.testing_resource.data"),
-					ProviderConfigAddr:         mustDefaultRootProvider("testing"),
-					NewStateSrc:                nil,
-					Schema:                     nil,
-				},
-			},
-			wantApplyDiags: []expectedDiagnostic{},
-		},
-	}
-
-	for name, tc := range tcs {
-		t.Run(name, func(t *testing.T) {
-			ctx := context.Background()
-			cfg := loadMainBundleConfigForTest(t, tc.source)
-
-			inputs := make(map[stackaddrs.InputVariable]ExternalInputValue, len(tc.inputs))
-			for name, input := range tc.inputs {
-				inputs[stackaddrs.InputVariable{Name: name}] = ExternalInputValue{
-					Value: input,
-				}
-			}
-
-			providers := map[addrs.Provider]providers.Factory{
-				addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
-					return stacks_testing_provider.NewProviderWithData(t, tc.store), nil
-				},
-			}
-
-			planChangesCh := make(chan stackplan.PlannedChange)
-			planDiagsCh := make(chan tfdiags.Diagnostic)
-			planReq := PlanRequest{
-				Config:             cfg,
-				ProviderFactories:  providers,
-				InputValues:        inputs,
-				ForcePlanTimestamp: &fakePlanTimestamp,
-				PrevState:          tc.initialState,
-				DependencyLocks:    *lock,
-			}
-			planResp := PlanResponse{
-				PlannedChanges: planChangesCh,
-				Diagnostics:    planDiagsCh,
-			}
-			go Plan(ctx, &planReq, &planResp)
-			gotPlanChanges, gotPlanDiags := collectPlanOutput(planChangesCh, planDiagsCh)
-
-			sort.SliceStable(gotPlanChanges, func(i, j int) bool {
-				return plannedChangeSortKey(gotPlanChanges[i]) < plannedChangeSortKey(gotPlanChanges[j])
-			})
-			sort.SliceStable(gotPlanDiags, diagnosticSortFunc(gotPlanDiags))
-
-			expectDiagnosticsForTest(t, gotPlanDiags, tc.wantPlanDiags...)
-			if diff := cmp.Diff(tc.wantPlanChanges, gotPlanChanges, ctydebug.CmpOptions, cmpCollectionsSet, cmpopts.IgnoreUnexported(states.ResourceInstanceObjectSrc{})); diff != "" {
-				t.Errorf("wrong changes\n%s", diff)
-			}
-
-			if t.Failed() {
-				// don't bother with the apply operation if the plan failed
-				return
-			}
-
-			planLoader := stackplan.NewLoader()
-			for _, change := range gotPlanChanges {
-				proto, err := change.PlannedChangeProto()
-				if err != nil {
-					t.Fatal(err)
-				}
-
-				for _, rawMsg := range proto.Raw {
-					err = planLoader.AddRaw(rawMsg)
-					if err != nil {
-						t.Fatal(err)
-					}
-				}
-			}
-			plan, err := planLoader.Plan()
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			applyChangesCh := make(chan stackstate.AppliedChange)
-			applyDiagsCh := make(chan tfdiags.Diagnostic)
-			applyReq := ApplyRequest{
-				Config:            cfg,
-				Plan:              plan,
-				ProviderFactories: providers,
-				DependencyLocks:   *lock,
-			}
-			applyResp := ApplyResponse{
-				AppliedChanges: applyChangesCh,
-				Diagnostics:    applyDiagsCh,
-			}
-
-			go Apply(ctx, &applyReq, &applyResp)
-			gotApplyChanges, gotApplyDiags := collectApplyOutput(applyChangesCh, applyDiagsCh)
-
-			sort.SliceStable(gotApplyChanges, func(i, j int) bool {
-				return appliedChangeSortKey(gotApplyChanges[i]) < appliedChangeSortKey(gotApplyChanges[j])
-			})
-			sort.SliceStable(gotApplyDiags, diagnosticSortFunc(gotApplyDiags))
-
-			expectDiagnosticsForTest(t, gotApplyDiags, tc.wantApplyDiags...)
-			if diff := cmp.Diff(tc.wantApplyChanges, gotApplyChanges, ctydebug.CmpOptions, cmpCollectionsSet, cmpopts.IgnoreUnexported(states.ResourceInstanceObjectSrc{})); diff != "" {
-				t.Errorf("wrong changes\n%s", diff)
-			}
-		})
-	}
-
 }
 
 func collectApplyOutput(changesCh <-chan stackstate.AppliedChange, diagsCh <-chan tfdiags.Diagnostic) ([]stackstate.AppliedChange, tfdiags.Diagnostics) {

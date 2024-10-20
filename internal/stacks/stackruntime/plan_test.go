@@ -58,17 +58,8 @@ func TestPlan_valid(t *testing.T) {
 				// We've added this test before the implementation was ready.
 				t.SkipNow()
 			}
-
 			ctx := context.Background()
-			cfg := loadMainBundleConfigForTest(t, name)
 
-			fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			changesCh := make(chan stackplan.PlannedChange, 8)
-			diagsCh := make(chan tfdiags.Diagnostic, 2)
 			lock := depsfile.NewLocks()
 			lock.SetProvider(
 				addrs.NewDefaultProvider("testing"),
@@ -82,9 +73,15 @@ func TestPlan_valid(t *testing.T) {
 				providerreqs.MustParseVersionConstraints("=0.0.0"),
 				providerreqs.PreferredHashes([]providerreqs.Hash{}),
 			)
-			req := PlanRequest{
-				Config: cfg,
-				ProviderFactories: map[addrs.Provider]providers.Factory{
+
+			fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			testContext := TestContext{
+				config: loadMainBundleConfigForTest(t, name),
+				providers: map[addrs.Provider]providers.Factory{
 					// We support both hashicorp/testing and
 					// terraform.io/builtin/testing as providers. This lets us
 					// test the provider aliasing feature. Both providers
@@ -101,40 +98,16 @@ func TestPlan_valid(t *testing.T) {
 						return stacks_testing_provider.NewProvider(t), nil
 					},
 				},
-				DependencyLocks: *lock,
-				InputValues: func() map[stackaddrs.InputVariable]ExternalInputValue {
-					inputs := map[stackaddrs.InputVariable]ExternalInputValue{}
-					for k, v := range tc.planInputVars {
-						inputs[stackaddrs.InputVariable{Name: k}] = ExternalInputValue{
-							Value: v,
-						}
-					}
-					return inputs
-				}(),
-				ForcePlanTimestamp: &fakePlanTimestamp,
-			}
-			resp := PlanResponse{
-				PlannedChanges: changesCh,
-				Diagnostics:    diagsCh,
+				dependencyLocks: *lock,
+				timestamp:       &fakePlanTimestamp,
 			}
 
-			go Plan(ctx, &req, &resp)
-			_, diags := collectPlanOutput(changesCh, diagsCh)
-
-			// We don't care about the planned changes here, just the
-			// diagnostics.
-
-			// The following will fail the test if there are any error
-			// diagnostics.
-			reportDiagnosticsForTest(t, diags)
-
-			// We also want to fail if there are just warnings, since the
-			// configurations here are supposed to be totally problem-free.
-			if len(diags) != 0 {
-				// reportDiagnosticsForTest already showed the diagnostics in
-				// the log
-				t.FailNow()
+			cycle := TestCycle{
+				planInputs:         tc.planInputVars,
+				wantPlannedChanges: nil, // don't care about the planned changes in this test.
+				wantPlannedDiags:   nil, // should return no diagnostics.
 			}
+			testContext.Plan(t, ctx, nil, cycle)
 		})
 	}
 }
@@ -158,17 +131,8 @@ func TestPlan_invalid(t *testing.T) {
 				// We've added this test before the implementation was ready.
 				t.SkipNow()
 			}
-
 			ctx := context.Background()
-			cfg := loadMainBundleConfigForTest(t, name)
 
-			fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			changesCh := make(chan stackplan.PlannedChange, 8)
-			diagsCh := make(chan tfdiags.Diagnostic, 2)
 			lock := depsfile.NewLocks()
 			lock.SetProvider(
 				addrs.NewDefaultProvider("testing"),
@@ -176,9 +140,15 @@ func TestPlan_invalid(t *testing.T) {
 				providerreqs.MustParseVersionConstraints("=0.0.0"),
 				providerreqs.PreferredHashes([]providerreqs.Hash{}),
 			)
-			req := PlanRequest{
-				Config: cfg,
-				ProviderFactories: map[addrs.Provider]providers.Factory{
+
+			fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			testContext := TestContext{
+				config: loadMainBundleConfigForTest(t, name),
+				providers: map[addrs.Provider]providers.Factory{
 					// We support both hashicorp/testing and
 					// terraform.io/builtin/testing as providers. This lets us
 					// test the provider aliasing feature. Both providers
@@ -190,31 +160,118 @@ func TestPlan_invalid(t *testing.T) {
 						return stacks_testing_provider.NewProvider(t), nil
 					},
 				},
-				DependencyLocks: *lock,
-				InputValues: func() map[stackaddrs.InputVariable]ExternalInputValue {
-					inputs := map[stackaddrs.InputVariable]ExternalInputValue{}
-					for k, v := range tc.planInputVars {
-						inputs[stackaddrs.InputVariable{Name: k}] = ExternalInputValue{
-							Value: v,
-						}
-					}
-					return inputs
-				}(),
-				ForcePlanTimestamp: &fakePlanTimestamp,
-			}
-			resp := PlanResponse{
-				PlannedChanges: changesCh,
-				Diagnostics:    diagsCh,
+				dependencyLocks: *lock,
+				timestamp:       &fakePlanTimestamp,
 			}
 
-			go Plan(ctx, &req, &resp)
-			_, gotDiags := collectPlanOutput(changesCh, diagsCh)
-			wantDiags := tc.diags()
-			sort.SliceStable(gotDiags, diagnosticSortFunc(gotDiags))
-
-			if diff := cmp.Diff(wantDiags.ForRPC(), gotDiags.ForRPC()); diff != "" {
-				t.Errorf("wrong diagnostics\n%s", diff)
+			cycle := TestCycle{
+				planInputs:         tc.planInputVars,
+				wantPlannedChanges: nil, // don't care about the planned changes in this test.
+				wantPlannedDiags:   tc.diags(),
 			}
+			testContext.Plan(t, ctx, nil, cycle)
+		})
+	}
+}
+
+// TestPlan uses a generic framework for running plan integration tests
+// against Stacks. Generally, new tests should be added into this function
+// rather than copying the large amount of duplicate code from the other
+// tests in this file.
+//
+// If you are editing other tests in this file, please consider moving them
+// into this test function so they can reuse the shared setup and boilerplate
+// code managing the boring parts of the test.
+func TestPlan(t *testing.T) {
+	fakePlanTimestamp, err := time.Parse(time.RFC3339, "1991-08-25T20:57:08Z")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tcs := map[string]struct {
+		path  string
+		state *stackstate.State
+		store *stacks_testing_provider.ResourceStore
+		cycle TestCycle
+	}{
+		"empty-destroy-with-data-source": {
+			path: path.Join("with-data-source", "dependent"),
+			cycle: TestCycle{
+				planMode: plans.DestroyMode,
+				planInputs: map[string]cty.Value{
+					"id": cty.StringVal("foo"),
+				},
+				wantPlannedChanges: []stackplan.PlannedChange{
+					&stackplan.PlannedChangeApplyable{
+						Applyable: true,
+					},
+					&stackplan.PlannedChangeComponentInstance{
+						Addr:                mustAbsComponentInstance("component.data"),
+						PlanApplyable:       true,
+						PlanComplete:        true,
+						Action:              plans.Delete,
+						Mode:                plans.DestroyMode,
+						RequiredComponents:  collections.NewSet(mustAbsComponent("component.self")),
+						PlannedOutputValues: make(map[string]cty.Value),
+						PlanTimestamp:       fakePlanTimestamp,
+					},
+					&stackplan.PlannedChangeComponentInstance{
+						Addr:          mustAbsComponentInstance("component.self"),
+						PlanComplete:  true,
+						PlanApplyable: true,
+						Action:        plans.Delete,
+						Mode:          plans.DestroyMode,
+						PlannedOutputValues: map[string]cty.Value{
+							"id": cty.NullVal(cty.DynamicPseudoType),
+						},
+						PlanTimestamp: fakePlanTimestamp,
+					},
+					&stackplan.PlannedChangeHeader{
+						TerraformVersion: version.SemVer,
+					},
+					&stackplan.PlannedChangePlannedTimestamp{
+						PlannedTimestamp: fakePlanTimestamp,
+					},
+					&stackplan.PlannedChangeRootInputValue{
+						Addr:          mustStackInputVariable("id"),
+						Action:        plans.Create,
+						Before:        cty.NullVal(cty.DynamicPseudoType),
+						After:         cty.StringVal("foo"),
+						DeleteOnApply: true,
+					},
+				},
+			},
+		},
+	}
+	for name, tc := range tcs {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+
+			lock := depsfile.NewLocks()
+			lock.SetProvider(
+				addrs.NewDefaultProvider("testing"),
+				providerreqs.MustParseVersion("0.0.0"),
+				providerreqs.MustParseVersionConstraints("=0.0.0"),
+				providerreqs.PreferredHashes([]providerreqs.Hash{}),
+			)
+
+			store := tc.store
+			if store == nil {
+				store = stacks_testing_provider.NewResourceStore()
+			}
+
+			testContext := TestContext{
+				timestamp: &fakePlanTimestamp,
+				config:    loadMainBundleConfigForTest(t, tc.path),
+				providers: map[addrs.Provider]providers.Factory{
+					addrs.NewDefaultProvider("testing"): func() (providers.Interface, error) {
+						return stacks_testing_provider.NewProviderWithData(t, store), nil
+					},
+				},
+				dependencyLocks: *lock,
+			}
+
+			testContext.Plan(t, ctx, tc.state, tc.cycle)
 		})
 	}
 }
@@ -377,22 +434,22 @@ func TestPlanWithVariableDefaults(t *testing.T) {
 					TerraformVersion: version.SemVer,
 				},
 				&stackplan.PlannedChangeOutputValue{
-					Addr:     stackaddrs.OutputValue{Name: "beep"},
-					Action:   plans.Create,
-					OldValue: plans.DynamicValue{0xc0},               // MessagePack nil
-					NewValue: plans.DynamicValue([]byte("\xa4BEEP")), // MessagePack string "BEEP"
+					Addr:   stackaddrs.OutputValue{Name: "beep"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.StringVal("BEEP"),
 				},
 				&stackplan.PlannedChangeOutputValue{
-					Addr:     stackaddrs.OutputValue{Name: "defaulted"},
-					Action:   plans.Create,
-					OldValue: plans.DynamicValue{0xc0},               // MessagePack nil
-					NewValue: plans.DynamicValue([]byte("\xa4BOOP")), // MessagePack string "BOOP"
+					Addr:   stackaddrs.OutputValue{Name: "defaulted"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.StringVal("BOOP"),
 				},
 				&stackplan.PlannedChangeOutputValue{
-					Addr:     stackaddrs.OutputValue{Name: "specified"},
-					Action:   plans.Create,
-					OldValue: plans.DynamicValue{0xc0},               // MessagePack nil
-					NewValue: plans.DynamicValue([]byte("\xa4BEEP")), // MessagePack string "BEEP"
+					Addr:   stackaddrs.OutputValue{Name: "specified"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.StringVal("BEEP"),
 				},
 				&stackplan.PlannedChangePlannedTimestamp{
 					PlannedTimestamp: fakePlanTimestamp,
@@ -401,7 +458,9 @@ func TestPlanWithVariableDefaults(t *testing.T) {
 					Addr: stackaddrs.InputVariable{
 						Name: "beep",
 					},
-					Value: cty.StringVal("BEEP"),
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.StringVal("BEEP"),
 				},
 			}
 			sort.SliceStable(gotChanges, func(i, j int) bool {
@@ -676,22 +735,28 @@ func TestPlanWithComplexVariableDefaults(t *testing.T) {
 			Schema: stacks_testing_provider.TestingResourceSchema,
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr: stackaddrs.InputVariable{Name: "default"},
-			Value: cty.ObjectVal(map[string]cty.Value{
+			Addr:   stackaddrs.InputVariable{Name: "default"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After: cty.ObjectVal(map[string]cty.Value{
 				"id":    cty.StringVal("cec9bc39"),
 				"value": cty.StringVal("hello, mercury!"),
 			}),
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr: stackaddrs.InputVariable{Name: "optional"},
-			Value: cty.ObjectVal(map[string]cty.Value{
+			Addr:   stackaddrs.InputVariable{Name: "optional"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After: cty.ObjectVal(map[string]cty.Value{
 				"id":    cty.NullVal(cty.String),
 				"value": cty.StringVal("hello, earth!"),
 			}),
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr: stackaddrs.InputVariable{Name: "optional_default"},
-			Value: cty.ObjectVal(map[string]cty.Value{
+			Addr:   stackaddrs.InputVariable{Name: "optional_default"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After: cty.ObjectVal(map[string]cty.Value{
 				"id":    cty.StringVal("78d8b3d7"),
 				"value": cty.StringVal("hello, venus!"),
 			}),
@@ -773,13 +838,13 @@ func TestPlanWithSingleResource(t *testing.T) {
 			TerraformVersion: version.SemVer,
 		},
 		&stackplan.PlannedChangeOutputValue{
-			Addr:     stackaddrs.OutputValue{Name: "obj"},
-			Action:   plans.Create,
-			OldValue: mustPlanDynamicValue(cty.NullVal(cty.DynamicPseudoType)),
-			NewValue: mustPlanDynamicValue(cty.ObjectVal(map[string]cty.Value{
+			Addr:   stackaddrs.OutputValue{Name: "obj"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After: cty.ObjectVal(map[string]cty.Value{
 				"input":  cty.StringVal("hello"),
 				"output": cty.UnknownVal(cty.String),
-			})),
+			}),
 		},
 		&stackplan.PlannedChangePlannedTimestamp{
 			PlannedTimestamp: fakePlanTimestamp,
@@ -911,13 +976,18 @@ func TestPlanWithEphemeralInputVariables(t *testing.T) {
 				Addr: stackaddrs.InputVariable{
 					Name: "eph",
 				},
+				Action:          plans.Create,
+				Before:          cty.NullVal(cty.DynamicPseudoType),
+				After:           cty.NullVal(cty.String), // ephemeral
 				RequiredOnApply: true,
 			},
 			&stackplan.PlannedChangeRootInputValue{
 				Addr: stackaddrs.InputVariable{
 					Name: "noneph",
 				},
-				Value: cty.StringVal("noneph value"),
+				Action: plans.Create,
+				Before: cty.NullVal(cty.DynamicPseudoType),
+				After:  cty.StringVal("noneph value"),
 			},
 		}
 		sort.SliceStable(gotChanges, func(i, j int) bool {
@@ -969,13 +1039,18 @@ func TestPlanWithEphemeralInputVariables(t *testing.T) {
 				Addr: stackaddrs.InputVariable{
 					Name: "eph",
 				},
+				Action:          plans.Create,
+				Before:          cty.NullVal(cty.DynamicPseudoType),
+				After:           cty.NullVal(cty.String), // ephemeral
 				RequiredOnApply: false,
 			},
 			&stackplan.PlannedChangeRootInputValue{
 				Addr: stackaddrs.InputVariable{
 					Name: "noneph",
 				},
-				Value: cty.NullVal(cty.String),
+				Action: plans.Create,
+				Before: cty.NullVal(cty.DynamicPseudoType),
+				After:  cty.NullVal(cty.String),
 			},
 		}
 		sort.SliceStable(gotChanges, func(i, j int) bool {
@@ -1022,10 +1097,10 @@ func TestPlanVariableOutputRoundtripNested(t *testing.T) {
 			TerraformVersion: version.SemVer,
 		},
 		&stackplan.PlannedChangeOutputValue{
-			Addr:     stackaddrs.OutputValue{Name: "msg"},
-			Action:   plans.Create,
-			OldValue: plans.DynamicValue{0xc0},                  // MessagePack nil
-			NewValue: plans.DynamicValue([]byte("\xa7default")), // MessagePack string "default"
+			Addr:   stackaddrs.OutputValue{Name: "msg"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.StringVal("default"),
 		},
 		&stackplan.PlannedChangePlannedTimestamp{
 			PlannedTimestamp: fakePlanTimestamp,
@@ -1034,7 +1109,9 @@ func TestPlanVariableOutputRoundtripNested(t *testing.T) {
 			Addr: stackaddrs.InputVariable{
 				Name: "msg",
 			},
-			Value: cty.StringVal("default"),
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.StringVal("default"),
 		},
 	}
 	sort.SliceStable(gotChanges, func(i, j int) bool {
@@ -1098,13 +1175,10 @@ func TestPlanSensitiveOutput(t *testing.T) {
 			TerraformVersion: version.SemVer,
 		},
 		&stackplan.PlannedChangeOutputValue{
-			Addr:     stackaddrs.OutputValue{Name: "result"},
-			Action:   plans.Create,
-			OldValue: plans.DynamicValue{0xc0}, // MessagePack nil
-			NewValue: mustPlanDynamicValue(cty.StringVal("secret")),
-			NewValueSensitivePaths: []cty.Path{
-				nil, // the whole value is sensitive
-			},
+			Addr:   stackaddrs.OutputValue{Name: "result"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.StringVal("secret").Mark(marks.Sensitive),
 		},
 		&stackplan.PlannedChangePlannedTimestamp{
 			PlannedTimestamp: fakePlanTimestamp,
@@ -1154,13 +1228,10 @@ func TestPlanSensitiveOutputNested(t *testing.T) {
 			TerraformVersion: version.SemVer,
 		},
 		&stackplan.PlannedChangeOutputValue{
-			Addr:     stackaddrs.OutputValue{Name: "result"},
-			Action:   plans.Create,
-			OldValue: plans.DynamicValue{0xc0}, // MessagePack nil
-			NewValue: mustPlanDynamicValue(cty.StringVal("secret")),
-			NewValueSensitivePaths: []cty.Path{
-				nil, // the whole value is sensitive
-			},
+			Addr:   stackaddrs.OutputValue{Name: "result"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.StringVal("secret").Mark(marks.Sensitive),
 		},
 		&stackplan.PlannedChangePlannedTimestamp{
 			PlannedTimestamp: fakePlanTimestamp,
@@ -1256,13 +1327,10 @@ func TestPlanSensitiveOutputAsInput(t *testing.T) {
 			TerraformVersion: version.SemVer,
 		},
 		&stackplan.PlannedChangeOutputValue{
-			Addr:     stackaddrs.OutputValue{Name: "result"},
-			Action:   plans.Create,
-			OldValue: plans.DynamicValue{0xc0}, // MessagePack nil
-			NewValue: mustPlanDynamicValue(cty.StringVal("SECRET")),
-			NewValueSensitivePaths: []cty.Path{
-				nil, // the whole value is sensitive
-			},
+			Addr:   stackaddrs.OutputValue{Name: "result"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType), // MessagePack nil
+			After:  cty.StringVal("SECRET").Mark(marks.Sensitive),
 		},
 		&stackplan.PlannedChangePlannedTimestamp{
 			PlannedTimestamp: fakePlanTimestamp,
@@ -1640,8 +1708,10 @@ func TestPlanWithSensitivePropagation(t *testing.T) {
 			PlannedTimestamp: fakePlanTimestamp,
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "id"},
-			Value: cty.NullVal(cty.String),
+			Addr:   stackaddrs.InputVariable{Name: "id"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.NullVal(cty.String),
 		},
 	}
 
@@ -1801,8 +1871,10 @@ func TestPlanWithSensitivePropagationNested(t *testing.T) {
 			PlanTimestamp: fakePlanTimestamp,
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "id"},
-			Value: cty.NullVal(cty.String),
+			Addr:   stackaddrs.InputVariable{Name: "id"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.NullVal(cty.String),
 		},
 	}
 
@@ -2234,12 +2306,16 @@ func TestPlanWithDeferredResource(t *testing.T) {
 			PlannedTimestamp: fakePlanTimestamp,
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "defer"},
-			Value: cty.BoolVal(true),
+			Addr:   stackaddrs.InputVariable{Name: "defer"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.BoolVal(true),
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "id"},
-			Value: cty.StringVal("62594ae3"),
+			Addr:   stackaddrs.InputVariable{Name: "id"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.StringVal("62594ae3"),
 		},
 	}
 
@@ -2475,8 +2551,10 @@ func TestPlanWithDeferredComponentForEach(t *testing.T) {
 			PlannedTimestamp: fakePlanTimestamp,
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "components"},
-			Value: cty.UnknownVal(cty.Set(cty.String)),
+			Addr:   stackaddrs.InputVariable{Name: "components"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.UnknownVal(cty.Set(cty.String)),
 		},
 	}
 
@@ -2725,12 +2803,16 @@ func TestPlanWithDeferredComponentReferences(t *testing.T) {
 			PlannedTimestamp: fakePlanTimestamp,
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "known_components"},
-			Value: cty.SetVal([]cty.Value{cty.StringVal("known")}),
+			Addr:   stackaddrs.InputVariable{Name: "known_components"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.SetVal([]cty.Value{cty.StringVal("known")}),
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "unknown_components"},
-			Value: cty.UnknownVal(cty.Set(cty.String)),
+			Addr:   stackaddrs.InputVariable{Name: "unknown_components"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.UnknownVal(cty.Set(cty.String)),
 		},
 	}
 
@@ -2875,8 +2957,10 @@ func TestPlanWithDeferredEmbeddedStackForEach(t *testing.T) {
 			},
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "stacks"},
-			Value: cty.UnknownVal(cty.Set(cty.String)),
+			Addr:   stackaddrs.InputVariable{Name: "stacks"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.UnknownVal(cty.Set(cty.String)),
 		},
 	}
 
@@ -3023,8 +3107,10 @@ func TestPlanWithDeferredEmbeddedStackAndComponentForEach(t *testing.T) {
 			},
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "stacks"},
-			Value: cty.UnknownVal(cty.Map(cty.Set(cty.String))),
+			Addr:   stackaddrs.InputVariable{Name: "stacks"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.UnknownVal(cty.Map(cty.Set(cty.String))),
 		},
 	}
 
@@ -3298,8 +3384,10 @@ func TestPlanWithDeferredProviderForEach(t *testing.T) {
 			PlannedTimestamp: fakePlanTimestamp,
 		},
 		&stackplan.PlannedChangeRootInputValue{
-			Addr:  stackaddrs.InputVariable{Name: "providers"},
-			Value: cty.UnknownVal(cty.Set(cty.String)),
+			Addr:   stackaddrs.InputVariable{Name: "providers"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.UnknownVal(cty.Set(cty.String)),
 		},
 	}
 
@@ -3638,7 +3726,9 @@ func TestPlanWithStateManipulation(t *testing.T) {
 					Addr: stackaddrs.InputVariable{
 						Name: "id",
 					},
-					Value:           cty.StringVal("imported"),
+					Action:          plans.Create,
+					Before:          cty.NullVal(cty.DynamicPseudoType),
+					After:           cty.StringVal("imported"),
 					RequiredOnApply: false,
 				},
 			},
@@ -3795,24 +3885,24 @@ func TestPlanWithStateManipulation(t *testing.T) {
 			}
 
 			wantCounts := tc.counts
-			for _, elem := range wantCounts.Elems() {
+			for key, elem := range wantCounts.All() {
 				// First, make sure everything we wanted is present.
-				if !gotCounts.HasKey(elem.K) {
-					t.Errorf("wrong counts: wanted %s but didn't get it", elem.K)
+				if !gotCounts.HasKey(key) {
+					t.Errorf("wrong counts: wanted %s but didn't get it", key)
 				}
 
 				// And that the values actually match.
-				got, want := gotCounts.Get(elem.K), elem.V
+				got, want := gotCounts.Get(key), elem
 				if diff := cmp.Diff(want, got); diff != "" {
 					t.Errorf("wrong counts for %s: %s", want.Addr, diff)
 				}
 
 			}
 
-			for _, elem := range gotCounts.Elems() {
+			for key := range gotCounts.All() {
 				// Then, make sure we didn't get anything we didn't want.
-				if !wantCounts.HasKey(elem.K) {
-					t.Errorf("wrong counts: got %s but didn't want it", elem.K)
+				if !wantCounts.HasKey(key) {
+					t.Errorf("wrong counts: got %s but didn't want it", key)
 				}
 			}
 		})
@@ -3928,10 +4018,10 @@ func TestPlan_plantimestamp_force_timestamp(t *testing.T) {
 			TerraformVersion: version.SemVer,
 		},
 		&stackplan.PlannedChangeOutputValue{
-			Addr:     stackaddrs.OutputValue{Name: "plantimestamp"},
-			Action:   plans.Create,
-			OldValue: mustPlanDynamicValue(cty.NullVal(cty.DynamicPseudoType)),
-			NewValue: mustPlanDynamicValue(cty.StringVal(forcedPlanTimestamp)),
+			Addr:   stackaddrs.OutputValue{Name: "plantimestamp"},
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.StringVal(forcedPlanTimestamp),
 		},
 		&stackplan.PlannedChangePlannedTimestamp{PlannedTimestamp: fakePlanTimestamp},
 	}
@@ -3981,11 +4071,7 @@ func TestPlan_plantimestamp_later_than_when_writing_this_test(t *testing.T) {
 	changes, diags := collectPlanOutput(changesCh, diagsCh)
 	output := expectOutput(t, "plantimestamp", changes)
 
-	plantimestampValue, err := output.NewValue.Decode(cty.String)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	plantimestampValue := output.After
 	plantimestamp, err := time.Parse(time.RFC3339, plantimestampValue.AsString())
 	if err != nil {
 		t.Fatal(err)
@@ -4235,13 +4321,17 @@ func TestPlan_DependsOnUpdatesRequirements(t *testing.T) {
 			Addr: stackaddrs.InputVariable{
 				Name: "empty",
 			},
-			Value: cty.SetValEmpty(cty.String),
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.SetValEmpty(cty.String),
 		},
 		&stackplan.PlannedChangeRootInputValue{
 			Addr: stackaddrs.InputVariable{
 				Name: "input",
 			},
-			Value: cty.StringVal("hello, world!"),
+			Action: plans.Create,
+			Before: cty.NullVal(cty.DynamicPseudoType),
+			After:  cty.StringVal("hello, world!"),
 		},
 	}
 
@@ -4359,14 +4449,18 @@ func TestPlan_RemovedBlocks(t *testing.T) {
 					PlannedTimestamp: fakePlanTimestamp,
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr: stackaddrs.InputVariable{Name: "input"},
-					Value: cty.SetVal([]cty.Value{
+					Addr:   stackaddrs.InputVariable{Name: "input"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After: cty.SetVal([]cty.Value{
 						cty.StringVal("a"),
 					}),
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr:  stackaddrs.InputVariable{Name: "removed"},
-					Value: cty.UnknownVal(cty.Set(cty.String)),
+					Addr:   stackaddrs.InputVariable{Name: "removed"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.UnknownVal(cty.Set(cty.String)),
 				},
 			},
 		},
@@ -4459,12 +4553,16 @@ func TestPlan_RemovedBlocks(t *testing.T) {
 					PlannedTimestamp: fakePlanTimestamp,
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr:  stackaddrs.InputVariable{Name: "input"},
-					Value: cty.SetValEmpty(cty.String),
+					Addr:   stackaddrs.InputVariable{Name: "input"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.SetValEmpty(cty.String),
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr:  stackaddrs.InputVariable{Name: "removed"},
-					Value: cty.UnknownVal(cty.Set(cty.String)),
+					Addr:   stackaddrs.InputVariable{Name: "removed"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.UnknownVal(cty.Set(cty.String)),
 				},
 			},
 		},
@@ -4619,12 +4717,16 @@ func TestPlan_RemovedBlocks(t *testing.T) {
 					PlannedTimestamp: fakePlanTimestamp,
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr:  stackaddrs.InputVariable{Name: "input"},
-					Value: cty.UnknownVal(cty.Set(cty.String)),
+					Addr:   stackaddrs.InputVariable{Name: "input"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.UnknownVal(cty.Set(cty.String)),
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr:  stackaddrs.InputVariable{Name: "removed"},
-					Value: cty.SetVal([]cty.Value{cty.StringVal("b")}),
+					Addr:   stackaddrs.InputVariable{Name: "removed"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.SetVal([]cty.Value{cty.StringVal("b")}),
 				},
 			},
 		},
@@ -4715,12 +4817,16 @@ func TestPlan_RemovedBlocks(t *testing.T) {
 					PlannedTimestamp: fakePlanTimestamp,
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr:  stackaddrs.InputVariable{Name: "input"},
-					Value: cty.UnknownVal(cty.Set(cty.String)),
+					Addr:   stackaddrs.InputVariable{Name: "input"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.UnknownVal(cty.Set(cty.String)),
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr:  stackaddrs.InputVariable{Name: "removed"},
-					Value: cty.UnknownVal(cty.Set(cty.String)),
+					Addr:   stackaddrs.InputVariable{Name: "removed"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After:  cty.UnknownVal(cty.Set(cty.String)),
 				},
 			},
 		},
@@ -4820,6 +4926,9 @@ func TestPlan_RemovedBlocks(t *testing.T) {
 					ProviderConfigAddr: mustDefaultRootProvider("testing"),
 					Schema:             stacks_testing_provider.TestingResourceSchema,
 				},
+				&stackplan.PlannedChangeComponentInstanceRemoved{
+					Addr: mustAbsComponentInstance("component.self[\"removed\"]"),
+				},
 				&stackplan.PlannedChangeHeader{
 					TerraformVersion: version.SemVer,
 				},
@@ -4827,14 +4936,18 @@ func TestPlan_RemovedBlocks(t *testing.T) {
 					PlannedTimestamp: fakePlanTimestamp,
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr: stackaddrs.InputVariable{Name: "input"},
-					Value: cty.SetVal([]cty.Value{
+					Addr:   stackaddrs.InputVariable{Name: "input"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After: cty.SetVal([]cty.Value{
 						cty.StringVal("a"),
 					}),
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr: stackaddrs.InputVariable{Name: "removed"},
-					Value: cty.SetVal([]cty.Value{
+					Addr:   stackaddrs.InputVariable{Name: "removed"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After: cty.SetVal([]cty.Value{
 						cty.StringVal("b"),
 					}),
 				},
@@ -4985,14 +5098,18 @@ func TestPlan_RemovedBlocks(t *testing.T) {
 					PlannedTimestamp: fakePlanTimestamp,
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr: stackaddrs.InputVariable{Name: "input"},
-					Value: cty.SetVal([]cty.Value{
+					Addr:   stackaddrs.InputVariable{Name: "input"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After: cty.SetVal([]cty.Value{
 						cty.StringVal("added"),
 					}),
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr: stackaddrs.InputVariable{Name: "removed"},
-					Value: cty.SetVal([]cty.Value{
+					Addr:   stackaddrs.InputVariable{Name: "removed"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After: cty.SetVal([]cty.Value{
 						cty.StringVal("removed"),
 					}),
 				},
@@ -5093,14 +5210,18 @@ func TestPlan_RemovedBlocks(t *testing.T) {
 					PlannedTimestamp: fakePlanTimestamp,
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr: stackaddrs.InputVariable{Name: "input"},
-					Value: cty.SetVal([]cty.Value{
+					Addr:   stackaddrs.InputVariable{Name: "input"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After: cty.SetVal([]cty.Value{
 						cty.StringVal("a"),
 					}),
 				},
 				&stackplan.PlannedChangeRootInputValue{
-					Addr: stackaddrs.InputVariable{Name: "removed"},
-					Value: cty.SetVal([]cty.Value{
+					Addr:   stackaddrs.InputVariable{Name: "removed"},
+					Action: plans.Create,
+					Before: cty.NullVal(cty.DynamicPseudoType),
+					After: cty.SetVal([]cty.Value{
 						cty.StringVal("a"),
 					}),
 				},
@@ -5214,7 +5335,7 @@ var cmpCollectionsSet = cmp.Comparer(func(x, y collections.Set[stackaddrs.AbsCom
 		return false
 	}
 
-	for _, v := range x.Elems() {
+	for v := range x.All() {
 		if !y.Has(v) {
 			return false
 		}

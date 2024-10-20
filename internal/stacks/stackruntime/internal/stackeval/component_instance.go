@@ -33,7 +33,8 @@ type ComponentInstance struct {
 	key      addrs.InstanceKey
 	deferred bool
 
-	main *Main
+	main    *Main
+	refresh *RefreshInstance
 
 	repetition instances.RepetitionData
 
@@ -46,13 +47,15 @@ var _ ExpressionScope = (*ComponentInstance)(nil)
 var _ ConfigComponentExpressionScope[stackaddrs.AbsComponentInstance] = (*ComponentInstance)(nil)
 
 func newComponentInstance(call *Component, key addrs.InstanceKey, repetition instances.RepetitionData, deferred bool) *ComponentInstance {
-	return &ComponentInstance{
+	component := &ComponentInstance{
 		call:       call,
 		key:        key,
 		deferred:   deferred,
 		main:       call.main,
 		repetition: repetition,
 	}
+	component.refresh = newRefreshInstance(component)
+	return component
 }
 
 func (c *ComponentInstance) Addr() stackaddrs.AbsComponentInstance {
@@ -152,6 +155,42 @@ func (c *ComponentInstance) inputValuesForModulesRuntime(ctx context.Context, ph
 	return ret
 }
 
+func (c *ComponentInstance) PlanOpts(ctx context.Context, mode plans.Mode, skipRefresh bool) (*terraform.PlanOpts, tfdiags.Diagnostics) {
+	decl := c.call.Declaration(ctx)
+
+	inputValues := c.inputValuesForModulesRuntime(ctx, PlanPhase)
+	if inputValues == nil {
+		return nil, nil
+	}
+
+	known, unknown, moreDiags := EvalProviderValues(ctx, c.main, c.call.Declaration(ctx).ProviderConfigs, PlanPhase, c)
+	if moreDiags.HasErrors() {
+		// We won't actually add the diagnostics here, they should be
+		// exposed via a different return path.
+		var diags tfdiags.Diagnostics
+		return nil, diags.Append(&hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "Cannot plan component",
+			Detail:   fmt.Sprintf("Cannot generate a plan for %s because its provider configuration assignments are invalid.", c.Addr()),
+			Subject:  decl.DeclRange.ToHCL().Ptr(),
+		})
+	}
+
+	providerClients := configuredProviderClients(ctx, c.main, known, unknown, PlanPhase)
+
+	plantimestamp := c.main.PlanTimestamp()
+	return &terraform.PlanOpts{
+		Mode:                       mode,
+		SkipRefresh:                skipRefresh,
+		SetVariables:               inputValues,
+		ExternalProviders:          providerClients,
+		ExternalDependencyDeferred: c.deferred,
+		DeferralAllowed:            true,
+		// We want the same plantimestamp between all components and the stacks language
+		ForcePlanTimestamp: &plantimestamp,
+	}, nil
+}
+
 func (c *ComponentInstance) ModuleTreePlan(ctx context.Context) *plans.Plan {
 	ret, _ := c.CheckModuleTreePlan(ctx)
 	return ret
@@ -167,122 +206,128 @@ func (c *ComponentInstance) CheckModuleTreePlan(ctx context.Context) (*plans.Pla
 		func(ctx context.Context) (*plans.Plan, tfdiags.Diagnostics) {
 			var diags tfdiags.Diagnostics
 
-			decl := c.call.Declaration(ctx)
+			mode := c.main.PlanningOpts().PlanningMode
+			if mode == plans.DestroyMode {
 
-			stackPlanOpts := c.main.PlanningOpts()
-			inputValues := c.inputValuesForModulesRuntime(ctx, PlanPhase)
-			if inputValues == nil || diags.HasErrors() {
-				return nil, diags
+				if !c.main.PlanPrevState().HasComponentInstance(c.Addr()) {
+					// If the component instance doesn't exist in the previous
+					// state at all, then we don't need to do anything.
+					//
+					// This means the component instance was added to the config
+					// and never applied, or that it was previously destroyed
+					// via an earlier destroy operation.
+					//
+					// Return a dummy plan:
+					return &plans.Plan{
+						UIMode:    plans.DestroyMode,
+						Complete:  true,
+						Applyable: true,
+						Errored:   false,
+						Timestamp: c.main.PlanTimestamp(),
+						Changes:   plans.NewChangesSrc(), // no changes
+					}, nil
+				}
+
+				// If we are destroying, then we are going to do the refresh
+				// and destroy plan in two separate stages. This helps resolves
+				// cycles within the dependency graph, as anything requiring
+				// outputs from this component can read from the refresh result
+				// without causing a cycle.
+
+				refresh, moreDiags := c.refresh.Plan(ctx)
+				var filteredDiags tfdiags.Diagnostics
+				for _, diag := range moreDiags {
+					if _, ok := addrs.DiagnosticOriginatesFromCheckRule(diag); ok && diag.Severity() == tfdiags.Warning {
+						// We'll discard diagnostics from check rules here,
+						// we're about to delete everything so anything not
+						// valid will go away anyway.
+						continue
+					}
+					filteredDiags = filteredDiags.Append(diag)
+				}
+				diags = diags.Append(filteredDiags)
+				if refresh == nil {
+					return nil, diags
+				}
+
+				// For the actual destroy plan, we'll skip the refresh and
+				// simply use the refreshed state from the refresh plan.
+				opts, moreDiags := c.PlanOpts(ctx, plans.DestroyMode, true)
+				diags = diags.Append(moreDiags)
+				if opts == nil {
+					return nil, diags
+				}
+
+				if !refresh.Complete {
+					// If the refresh was deferred, then we'll defer the destroy
+					// plan as well.
+					opts.ExternalDependencyDeferred = true
+				} else {
+					// If we're destroying this instance, then the dependencies
+					// should be reversed. Unfortunately, we can't compute that
+					// easily so instead we'll use the dependents computed at the
+					// last apply operation.
+					for depAddr := range c.PlanPrevDependents(ctx).All() {
+						depStack := c.main.Stack(ctx, depAddr.Stack, PlanPhase)
+						if depStack == nil {
+							// something weird has happened, but this means that
+							// whatever thing we're depending on being deleted first
+							// doesn't exist so it's fine.
+							continue
+						}
+						depComponent, depRemoved := depStack.ApplyableComponents(ctx, depAddr.Item)
+						if depComponent != nil && !depComponent.PlanIsComplete(ctx) {
+							opts.ExternalDependencyDeferred = true
+							break
+						}
+						if depRemoved != nil && !depRemoved.PlanIsComplete(ctx) {
+							opts.ExternalDependencyDeferred = true
+							break
+						}
+					}
+				}
+
+				plan, moreDiags := PlanComponentInstance(ctx, c.main, refresh.PriorState, opts, c)
+				return plan, diags.Append(moreDiags)
 			}
 
-			known, unknown, moreDiags := EvalProviderValues(ctx, c.main, c.call.Declaration(ctx).ProviderConfigs, PlanPhase, c)
-			if moreDiags.HasErrors() {
-				// We won't actually add the diagnostics here, they should be
-				// exposed via a different return path.
-				diags = diags.Append(&hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Cannot plan component",
-					Detail:   fmt.Sprintf("Cannot generate a plan for %s because its provider configuration assignments are invalid.", c.Addr()),
-					Subject:  decl.DeclRange.ToHCL().Ptr(),
-				})
+			opts, moreDiags := c.PlanOpts(ctx, mode, false)
+			diags = diags.Append(moreDiags)
+			if opts == nil {
 				return nil, diags
 			}
-
-			providerClients := configuredProviderClients(ctx, c.main, known, unknown, PlanPhase)
 
 			// If any of our upstream components have incomplete plans then
 			// we need to force treating everything in this component as
 			// deferred so we can preserve the correct dependency ordering.
-			deferred := c.deferred
-			if stackPlanOpts.PlanningMode == plans.DestroyMode {
-				// If we're destroying this instance, then the dependencies
-				// should be reversed. Unfortunately, we can't compute that
-				// easily so instead we'll use the dependents computed at the
-				// last apply operation.
-				for _, depAddr := range c.PlanPrevDependents(ctx).Elems() {
-					depStack := c.main.Stack(ctx, depAddr.Stack, PlanPhase)
-					if depStack == nil {
-						// something weird has happened, but this means that
-						// whatever thing we're depending on being deleted first
-						// doesn't exist so it's fine.
-						break
-					}
-					depComponent := depStack.Component(ctx, depAddr.Item)
-					if depComponent == nil {
-						// again, the thing we need to wait to be deleted
-						// doesn't exist so it's fine.
-						break
-					}
-					if !depComponent.PlanIsComplete(ctx) {
-						// The other component couldn't be deleted in a single
-						// go, so to be safe we'll defer our deletions until
-						// the other one is complete.
-						deferred = true
-						break
-					}
+			for depAddr := range c.call.RequiredComponents(ctx).All() {
+				depStack := c.main.Stack(ctx, depAddr.Stack, PlanPhase)
+				if depStack == nil {
+					opts.ExternalDependencyDeferred = true // to be conservative
+					break
 				}
-			} else {
-				for _, depAddr := range c.call.RequiredComponents(ctx).Elems() {
-					depStack := c.main.Stack(ctx, depAddr.Stack, PlanPhase)
-					if depStack == nil {
-						deferred = true // to be conservative
-						break
-					}
-					depComponent := depStack.Component(ctx, depAddr.Item)
-					if depComponent == nil {
-						deferred = true // to be conservative
-						break
-					}
-					if !depComponent.PlanIsComplete(ctx) {
-						deferred = true
-						break
-					}
+				depComponent := depStack.Component(ctx, depAddr.Item)
+				if depComponent == nil {
+					opts.ExternalDependencyDeferred = true // to be conservative
+					break
 				}
-
-				// We're also going to look through any upstream components
-				// that are being removed to make sure they are removed first.
-				for _, depAddr := range c.PlanPrevDependents(ctx).Elems() {
-					depStack := c.main.Stack(ctx, depAddr.Stack, PlanPhase)
-					if depStack == nil {
-						break
-					}
-					depRemoved := depStack.Removed(ctx, depAddr.Item)
-					if depRemoved == nil {
-						break
-					}
-					if !depRemoved.PlanIsComplete(ctx) {
-						// The other component couldn't be deleted in a single
-						// go, so to be safe we'll defer our deletions until
-						// the other one is complete.
-						deferred = true
-						break
-					}
+				if !depComponent.PlanIsComplete(ctx) {
+					opts.ExternalDependencyDeferred = true
+					break
 				}
 			}
 
 			// The instance is also upstream deferred if the for_each value for
 			// this instance or any parent stacks is unknown.
 			if c.key == addrs.WildcardKey {
-				deferred = true
+				opts.ExternalDependencyDeferred = true
 			} else {
 				for _, step := range c.call.addr.Stack {
 					if step.Key == addrs.WildcardKey {
-						deferred = true
+						opts.ExternalDependencyDeferred = true
 						break
 					}
 				}
-			}
-
-			plantimestamp := c.main.PlanTimestamp()
-			opts := &terraform.PlanOpts{
-				Mode:                       stackPlanOpts.PlanningMode,
-				SetVariables:               inputValues,
-				ExternalProviders:          providerClients,
-				DeferralAllowed:            true,
-				ExternalDependencyDeferred: deferred,
-
-				// We want the same plantimestamp between all components and the stacks language
-				ForcePlanTimestamp: &plantimestamp,
 			}
 
 			plan, moreDiags := PlanComponentInstance(ctx, c.main, c.PlanPrevState(ctx), opts, c)
@@ -304,6 +349,18 @@ func (c *ComponentInstance) ApplyModuleTreePlan(ctx context.Context, plan *plans
 	var diags tfdiags.Diagnostics
 	if !c.main.Applying() {
 		panic("called ApplyModuleTreePlan with an evaluator not instantiated for applying")
+	}
+
+	if plan.UIMode == plans.DestroyMode && plan.Changes.Empty() {
+		stackPlan := c.main.PlanBeingApplied().Components.Get(c.Addr())
+
+		// If we're destroying and there's nothing to destroy, then we can
+		// consider this a no-op.
+		return &ComponentInstanceApplyResult{
+			FinalState:                      plan.PriorState, // after refresh
+			AffectedResourceInstanceObjects: resourceInstanceObjectsAffectedByStackPlan(stackPlan),
+			Complete:                        true,
+		}, diags
 	}
 
 	// This is the result to return along with any errors that prevent us from
@@ -466,35 +523,9 @@ func (c *ComponentInstance) ResultValue(ctx context.Context, phase EvalPhase) ct
 	case PlanPhase:
 
 		if c.main.PlanningOpts().PlanningMode == plans.DestroyMode {
-			// If we are running a destroy plan, we should return the prior
-			// state's output values, as the new planned state will have nothing
-			// since it's been destroyed.
-			prevResult := c.PlanPrevResult(ctx)
-			obj := make(map[string]cty.Value, len(prevResult))
-			for k, v := range prevResult {
-				obj[k.Name] = v
-			}
-
-			moduleTree := c.call.Config(ctx).ModuleTree(ctx)
-			if moduleTree == nil {
-				return cty.DynamicVal
-			}
-
-			// This shouldn't matter as callers should use the configuration
-			// that was last applied when destroying, but just in case we'll
-			// add in any output values that were declared in the configuration
-			// but not yet present in the state.
-			for name := range moduleTree.Module.Outputs {
-				if _, exists := obj[name]; exists {
-					continue
-				}
-				// We can't do any better than DynamicVal here because
-				// output values in the modules language don't have static
-				// type constraints.
-				obj[name] = cty.DynamicVal
-			}
-
-			return cty.ObjectVal(obj)
+			// If we are running a destroy plan, then we'll return the result
+			// of our refresh operation.
+			return cty.ObjectVal(c.refresh.Result(ctx))
 		}
 
 		plan := c.ModuleTreePlan(ctx)
@@ -519,7 +550,8 @@ func (c *ComponentInstance) ResultValue(ctx context.Context, phase EvalPhase) ct
 				// Weird, but we'll tolerate it.
 				return cty.DynamicVal
 			}
-			if ourPlan.PlannedAction == plans.Delete {
+
+			if ourPlan.PlannedAction == plans.Delete || ourPlan.PlannedAction == plans.Forget {
 				// In this case our result was already decided during the
 				// planning phase, because we can't block on anything else
 				// here to make sure we don't create a self-dependency
@@ -661,7 +693,15 @@ func (c *ComponentInstance) PlanChanges(ctx context.Context) ([]stackplan.Planne
 			action = plans.Create
 		}
 
-		changes, moreDiags = stackplan.FromPlan(ctx, c.ModuleTree(ctx), corePlan, action, c)
+		var refreshPlan *plans.Plan
+		if c.main.PlanningOpts().PlanningMode == plans.DestroyMode {
+			// if we're in destroy mode, then we did a separate refresh plan
+			// so we'll make sure to pass that in as extra information the
+			// FromPlan function can use.
+			refreshPlan, _ = c.refresh.Plan(ctx)
+		}
+
+		changes, moreDiags = stackplan.FromPlan(ctx, c.ModuleTree(ctx), corePlan, refreshPlan, action, c)
 		diags = diags.Append(moreDiags)
 	}
 

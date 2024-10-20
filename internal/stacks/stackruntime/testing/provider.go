@@ -65,6 +65,11 @@ type MockProvider struct {
 	*testing_provider.MockProvider
 
 	ResourceStore *ResourceStore
+
+	// If set, authentication means the configuration must provide a value
+	// that matches the value here otherwise the Configure function will
+	// fail.
+	Authentication string
 }
 
 // NewProvider returns a new MockProvider with an empty data store.
@@ -89,10 +94,30 @@ func NewProviderWithData(t *testing.T, store *ResourceStore) *MockProvider {
 				Provider: providers.Schema{
 					Block: &configschema.Block{
 						Attributes: map[string]*configschema.Attribute{
+							// if the configuration sets require_auth then it
+							// must also provide the correct value for
+							// authentication
+							"authentication": {
+								Type:      cty.String,
+								Sensitive: true,
+								Optional:  true,
+							},
+							"require_auth": {
+								Type:     cty.Bool,
+								Optional: true,
+							},
+
+							// If this value is provider, the Configure
+							// function call will fail and return the value
+							// here as part of the error.
 							"configure_error": {
 								Type:     cty.String,
 								Optional: true,
 							},
+
+							// ignored allows the configuration to create
+							// dependencies from this provider to component
+							// blocks and inputs without affecting behaviour.
 							"ignored": {
 								Type:     cty.String,
 								Optional: true,
@@ -131,18 +156,6 @@ func NewProviderWithData(t *testing.T, store *ResourceStore) *MockProvider {
 					MoveResourceState: true,
 				},
 			},
-			ConfigureProviderFn: func(request providers.ConfigureProviderRequest) providers.ConfigureProviderResponse {
-				// If configure_error is set, return an error.
-				err := request.Config.GetAttr("configure_error")
-				if err.IsKnown() && !err.IsNull() {
-					return providers.ConfigureProviderResponse{
-						Diagnostics: tfdiags.Diagnostics{
-							tfdiags.AttributeValue(tfdiags.Error, err.AsString(), "configure_error attribute was set", cty.GetAttrPath("configure_error")),
-						},
-					}
-				}
-				return providers.ConfigureProviderResponse{}
-			},
 			PlanResourceChangeFn: func(request providers.PlanResourceChangeRequest) providers.PlanResourceChangeResponse {
 				return getResource(request.TypeName).Plan(request, store)
 			},
@@ -155,8 +168,15 @@ func NewProviderWithData(t *testing.T, store *ResourceStore) *MockProvider {
 			ReadDataSourceFn: func(request providers.ReadDataSourceRequest) providers.ReadDataSourceResponse {
 				var diags tfdiags.Diagnostics
 
-				id := request.Config.GetAttr("id").AsString()
-				value, exists := store.Get(id)
+				id := request.Config.GetAttr("id")
+				if id.IsNull() {
+					diags = diags.Append(tfdiags.Sourceless(tfdiags.Error, "missing id", "id is required"))
+					return providers.ReadDataSourceResponse{
+						Diagnostics: diags,
+					}
+				}
+
+				value, exists := store.Get(id.AsString())
 				if !exists {
 					diags = diags.Append(tfdiags.Sourceless(tfdiags.Error, "not found", fmt.Sprintf("%q not found", id)))
 				}
@@ -228,6 +248,10 @@ func NewProviderWithData(t *testing.T, store *ResourceStore) *MockProvider {
 		ResourceStore: store,
 	}
 
+	// We want to use internal fields in this function so we have to set it
+	// like this.
+	provider.ConfigureProviderFn = provider.configure
+
 	t.Cleanup(func() {
 		// Fail the test if this provider is not closed.
 		if !provider.CloseCalled {
@@ -237,6 +261,43 @@ func NewProviderWithData(t *testing.T, store *ResourceStore) *MockProvider {
 	})
 
 	return provider
+}
+
+func (provider *MockProvider) configure(request providers.ConfigureProviderRequest) providers.ConfigureProviderResponse {
+	// If configure_error is set, return an error.
+	err := request.Config.GetAttr("configure_error")
+	if err.IsKnown() && !err.IsNull() {
+		return providers.ConfigureProviderResponse{
+			Diagnostics: tfdiags.Diagnostics{
+				tfdiags.AttributeValue(tfdiags.Error, err.AsString(), "configure_error attribute was set", cty.GetAttrPath("configure_error")),
+			},
+		}
+	}
+
+	// We deliberately only check the authentication if the configuration
+	// is providing it. It's entirely up to the config to opt into the
+	// authentication which would be crazy for a real provider but just
+	// makes things so much simpler for us in testing world.
+	requireAuth := request.Config.GetAttr("require_auth")
+	if requireAuth.True() {
+		authn := request.Config.GetAttr("authentication")
+		if authn.IsNull() || !authn.IsKnown() {
+			return providers.ConfigureProviderResponse{
+				Diagnostics: tfdiags.Diagnostics{
+					tfdiags.AttributeValue(tfdiags.Error, "Authentication failed", "authentication field is required", cty.GetAttrPath("authentication")),
+				},
+			}
+		}
+		if authn.AsString() != provider.Authentication {
+			return providers.ConfigureProviderResponse{
+				Diagnostics: tfdiags.Diagnostics{
+					tfdiags.AttributeValue(tfdiags.Error, "Authentication failed", "authentication field did not match expected", cty.GetAttrPath("authentication")),
+				},
+			}
+		}
+	}
+
+	return providers.ConfigureProviderResponse{}
 }
 
 // mustGenerateUUID is a helper to generate a UUID and panic if it fails.

@@ -112,7 +112,7 @@ func (r *RemovedInstance) ModuleTreePlan(ctx context.Context) (*plans.Plan, tfdi
 		providerClients := configuredProviderClients(ctx, r.main, known, unknown, PlanPhase)
 
 		deferred := r.deferred
-		for _, depAddr := range r.PlanPrevDependents(ctx).Elems() {
+		for depAddr := range r.PlanPrevDependents(ctx).All() {
 			depStack := r.main.Stack(ctx, depAddr.Stack, PlanPhase)
 			if depStack == nil {
 				// something weird has happened, but this means that
@@ -120,28 +120,26 @@ func (r *RemovedInstance) ModuleTreePlan(ctx context.Context) (*plans.Plan, tfdi
 				// doesn't exist so it's fine.
 				break
 			}
-			depComponent := depStack.Component(ctx, depAddr.Item)
-			if depComponent == nil {
-				// again, the thing we need to wait to be deleted
-				// doesn't exist so it's fine.
+			depComponent, depRemoved := depStack.ApplyableComponents(ctx, depAddr.Item)
+			if depComponent != nil && !depComponent.PlanIsComplete(ctx) {
+				deferred = true
 				break
 			}
-			if !depComponent.PlanIsComplete(ctx) {
-				// The other component couldn't be deleted in a single
-				// go, so to be safe we'll defer our deletions until
-				// the other one is complete.
+			if depRemoved != nil && !depRemoved.PlanIsComplete(ctx) {
 				deferred = true
 				break
 			}
 		}
 
 		plantimestamp := r.main.PlanTimestamp()
+		forget := !r.call.Config(ctx).config.Destroy
 		opts := &terraform.PlanOpts{
 			Mode:                       plans.DestroyMode,
 			SetVariables:               r.PlanPrevInputs(ctx),
 			ExternalProviders:          providerClients,
 			DeferralAllowed:            true,
 			ExternalDependencyDeferred: deferred,
+			Forget:                     forget,
 
 			// We want the same plantimestamp between all components and the stacks language
 			ForcePlanTimestamp: &plantimestamp,
@@ -256,7 +254,13 @@ func (r *RemovedInstance) PlanChanges(ctx context.Context) ([]stackplan.PlannedC
 
 	var changes []stackplan.PlannedChange
 	if plan != nil {
-		changes, moreDiags = stackplan.FromPlan(ctx, r.ModuleTree(ctx), plan, plans.Delete, r)
+		var action plans.Action
+		if r.call.Config(ctx).config.Destroy {
+			action = plans.Delete
+		} else {
+			action = plans.Forget
+		}
+		changes, moreDiags = stackplan.FromPlan(ctx, r.ModuleTree(ctx), plan, nil, action, r)
 		diags = diags.Append(moreDiags)
 	}
 	return changes, diags

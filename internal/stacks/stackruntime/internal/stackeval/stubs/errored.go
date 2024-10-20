@@ -128,6 +128,34 @@ func (p *erroredProvider) ReadResource(req providers.ReadResourceRequest) provid
 	}
 }
 
+// OpenEphemeralResource implements providers.Interface.
+func (p *erroredProvider) OpenEphemeralResource(providers.OpenEphemeralResourceRequest) providers.OpenEphemeralResourceResponse {
+	var diags tfdiags.Diagnostics
+	diags = diags.Append(tfdiags.AttributeValue(
+		tfdiags.Error,
+		"Provider configuration is invalid",
+		"Cannot open this ephemeral resource instance because its associated provider configuration is invalid.",
+		nil, // nil attribute path means the overall configuration block
+	))
+	return providers.OpenEphemeralResourceResponse{
+		Diagnostics: diags,
+	}
+}
+
+// RenewEphemeralResource implements providers.Interface.
+func (p *erroredProvider) RenewEphemeralResource(providers.RenewEphemeralResourceRequest) providers.RenewEphemeralResourceResponse {
+	// We don't have anything to do here because OpenEphemeralResource didn't really
+	// actually "open" anything.
+	return providers.RenewEphemeralResourceResponse{}
+}
+
+// CloseEphemeralResource implements providers.Interface.
+func (p *erroredProvider) CloseEphemeralResource(providers.CloseEphemeralResourceRequest) providers.CloseEphemeralResourceResponse {
+	// We don't have anything to do here because OpenEphemeralResource didn't really
+	// actually "open" anything.
+	return providers.CloseEphemeralResourceResponse{}
+}
+
 // Stop implements providers.Interface.
 func (p *erroredProvider) Stop() error {
 	// This stub provider never actually does any real work, so there's nothing
@@ -170,6 +198,14 @@ func (p *erroredProvider) ValidateProviderConfig(req providers.ValidateProviderC
 	return providers.ValidateProviderConfigResponse{
 		PreparedConfig: req.Config,
 		Diagnostics:    nil,
+	}
+}
+
+// ValidateEphemeralResourceConfig implements providers.Interface.
+func (p *erroredProvider) ValidateEphemeralResourceConfig(providers.ValidateEphemeralResourceConfigRequest) providers.ValidateEphemeralResourceConfigResponse {
+
+	return providers.ValidateEphemeralResourceConfigResponse{
+		Diagnostics: nil,
 	}
 }
 

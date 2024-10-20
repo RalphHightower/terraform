@@ -72,6 +72,20 @@ func (o *offlineProvider) ValidateDataResourceConfig(request providers.ValidateD
 	}
 }
 
+// ValidateEphemeralResourceConfig implements providers.Interface.
+func (p *offlineProvider) ValidateEphemeralResourceConfig(providers.ValidateEphemeralResourceConfigRequest) providers.ValidateEphemeralResourceConfigResponse {
+	var diags tfdiags.Diagnostics
+	diags = diags.Append(tfdiags.AttributeValue(
+		tfdiags.Error,
+		"Called ValidateEphemeralResourceConfig on an unconfigured provider",
+		"Cannot validate this resource config because this provider is not configured. This is a bug in Terraform - please report it.",
+		nil, // nil attribute path means the overall configuration block
+	))
+	return providers.ValidateEphemeralResourceConfigResponse{
+		Diagnostics: diags,
+	}
+}
+
 func (o *offlineProvider) UpgradeResourceState(request providers.UpgradeResourceStateRequest) providers.UpgradeResourceStateResponse {
 	var diags tfdiags.Diagnostics
 	diags = diags.Append(tfdiags.AttributeValue(
@@ -170,6 +184,34 @@ func (o *offlineProvider) ReadDataSource(request providers.ReadDataSourceRequest
 	return providers.ReadDataSourceResponse{
 		Diagnostics: diags,
 	}
+}
+
+// OpenEphemeralResource implements providers.Interface.
+func (u *offlineProvider) OpenEphemeralResource(providers.OpenEphemeralResourceRequest) providers.OpenEphemeralResourceResponse {
+	var diags tfdiags.Diagnostics
+	diags = diags.Append(tfdiags.AttributeValue(
+		tfdiags.Error,
+		"Called OpenEphemeralResource on an unconfigured provider",
+		"Cannot open this resource instance because this provider is not configured. This is a bug in Terraform - please report it.",
+		nil, // nil attribute path means the overall configuration block
+	))
+	return providers.OpenEphemeralResourceResponse{
+		Diagnostics: diags,
+	}
+}
+
+// RenewEphemeralResource implements providers.Interface.
+func (u *offlineProvider) RenewEphemeralResource(providers.RenewEphemeralResourceRequest) providers.RenewEphemeralResourceResponse {
+	// We don't have anything to do here because OpenEphemeralResource didn't really
+	// actually "open" anything.
+	return providers.RenewEphemeralResourceResponse{}
+}
+
+// CloseEphemeralResource implements providers.Interface.
+func (u *offlineProvider) CloseEphemeralResource(providers.CloseEphemeralResourceRequest) providers.CloseEphemeralResourceResponse {
+	// We don't have anything to do here because OpenEphemeralResource didn't really
+	// actually "open" anything.
+	return providers.CloseEphemeralResourceResponse{}
 }
 
 func (o *offlineProvider) CallFunction(request providers.CallFunctionRequest) providers.CallFunctionResponse {
