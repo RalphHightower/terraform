@@ -2357,20 +2357,12 @@ locals {
 	// The local value should remain in the graph because the external
 	// reference uses it.
 	gotGraph := g.String()
-	wantGraph := `<external ref to local.local_value>
-  local.local_value (expand)
-local.local_value (expand)
-  test_object.a (expand)
-provider["registry.terraform.io/hashicorp/test"]
+	wantGraph := `provider["registry.terraform.io/hashicorp/test"]
 provider["registry.terraform.io/hashicorp/test"] (close)
   test_object.a (destroy)
-  test_object.a (expand)
 root
-  <external ref to local.local_value>
   provider["registry.terraform.io/hashicorp/test"] (close)
 test_object.a (destroy)
-  provider["registry.terraform.io/hashicorp/test"]
-test_object.a (expand)
   provider["registry.terraform.io/hashicorp/test"]
 `
 	if diff := cmp.Diff(wantGraph, gotGraph); diff != "" {
@@ -3629,6 +3621,87 @@ resource "test_object" "c" {
 			if len(deps) != 1 || deps[0].Resource.Name != "b" {
 				t.Error(res.Addr, "should only record a dependency of 'b', got", deps)
 			}
+		}
+	}
+}
+
+func TestContext2Apply_updateForcedCreateBeforeDestroy(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_object" "a" {
+}
+
+resource "test_object" "b" {
+  ref = test_object.a.id
+  update = "new"
+}
+
+resource "test_object" "c" {
+  ref = test_object.b.id
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+`,
+	})
+
+	p := &testing_provider.MockProvider{}
+	p.GetProviderSchemaResponse = &providers.GetProviderSchemaResponse{
+		ResourceTypes: map[string]providers.Schema{
+			"test_object": {
+				Block: &configschema.Block{
+					Attributes: map[string]*configschema.Attribute{
+						"id": {
+							Type:     cty.String,
+							Computed: true,
+						},
+						"ref": {
+							Type:     cty.String,
+							Optional: true,
+						},
+						"update": {
+							Type:     cty.String,
+							Optional: true,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	state := states.BuildState(func(s *states.SyncState) {
+		s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.a"), &states.ResourceInstanceObjectSrc{
+			AttrsJSON:           []byte(`{"id":"a"}`),
+			Status:              states.ObjectReady,
+			CreateBeforeDestroy: true,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+		s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.b"), &states.ResourceInstanceObjectSrc{
+			AttrsJSON:           []byte(`{"id":"b","ref":"a","update":"old"}`),
+			Status:              states.ObjectReady,
+			CreateBeforeDestroy: true,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+		s.SetResourceInstanceCurrent(mustResourceInstanceAddr("test_object.c"), &states.ResourceInstanceObjectSrc{
+			AttrsJSON:           []byte(`{"id":"c","ref":"b"}`),
+			Status:              states.ObjectReady,
+			CreateBeforeDestroy: true,
+		}, mustProviderConfig(`provider["registry.terraform.io/hashicorp/test"]`))
+	})
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("test"): testProviderFuncFixed(p),
+		},
+	})
+
+	plan, diags := ctx.Plan(m, state, SimplePlanOpts(plans.NormalMode, testInputValuesUnset(m.Module.Variables)))
+	assertNoErrors(t, diags)
+
+	state, diags = ctx.Apply(plan, m, nil)
+	assertNoErrors(t, diags)
+
+	for _, res := range state.RootModule().Resources {
+		if !res.Instances[addrs.NoKey].Current.CreateBeforeDestroy {
+			t.Errorf("%s should be create_before_destroy", res.Addr)
 		}
 	}
 }

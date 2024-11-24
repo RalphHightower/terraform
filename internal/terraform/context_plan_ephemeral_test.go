@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/terraform/internal/addrs"
 	"github.com/hashicorp/terraform/internal/configs"
@@ -20,7 +21,6 @@ import (
 
 func TestContext2Plan_ephemeralValues(t *testing.T) {
 	for name, tc := range map[string]struct {
-		toBeImplemented                             bool // Skip the test
 		module                                      map[string]string
 		expectValidateDiagnostics                   func(m *configs.Config) tfdiags.Diagnostics
 		expectPlanDiagnostics                       func(m *configs.Config) tfdiags.Diagnostics
@@ -29,6 +29,7 @@ func TestContext2Plan_ephemeralValues(t *testing.T) {
 		expectCloseEphemeralResourceCalled          bool
 		assertTestProviderConfigure                 func(req providers.ConfigureProviderRequest) (resp providers.ConfigureProviderResponse)
 		assertPlan                                  func(*testing.T, *plans.Plan)
+		inputs                                      InputValues
 	}{
 		"basic": {
 			module: map[string]string{
@@ -157,7 +158,7 @@ resource "test_object" "test" {
 }
 `,
 			},
-			expectPlanDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
+			expectValidateDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
 				return diags.Append(&hcl.Diagnostic{
 					Severity: hcl.DiagError,
 					Summary:  "Invalid for_each argument",
@@ -177,7 +178,7 @@ resource "test_object" "test" {
 }
 `,
 			},
-			expectPlanDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
+			expectValidateDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
 				return diags.Append(&hcl.Diagnostic{
 					Severity: hcl.DiagError,
 					Summary:  "Invalid count argument",
@@ -203,7 +204,7 @@ module "child" {
 `,
 			},
 
-			expectPlanDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
+			expectValidateDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
 				return diags.Append(&hcl.Diagnostic{
 					Severity: hcl.DiagError,
 					Summary:  "Invalid for_each argument",
@@ -253,13 +254,8 @@ resource "test_object" "test" {
 }
 `,
 			},
-			expectPlanDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
+			expectValidateDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
 				return diags.Append(
-					&hcl.Diagnostic{
-						Severity: hcl.DiagError,
-						Summary:  "Invalid for_each argument",
-						Detail:   `The given "for_each" value is derived from an ephemeral value, which means that Terraform cannot persist it between plan/apply rounds. Use only non-ephemeral values to specify a resource's instance keys.`,
-					},
 					&hcl.Diagnostic{
 						Severity: hcl.DiagError,
 						Summary:  "Invalid for_each argument",
@@ -270,7 +266,6 @@ resource "test_object" "test" {
 		},
 
 		"functions": {
-			toBeImplemented: true,
 			module: map[string]string{
 				"child/main.tf": `
 ephemeral "ephem_resource" "data" {}
@@ -297,7 +292,6 @@ module "child" {
 		},
 
 		"provider-defined functions": {
-			toBeImplemented: true,
 			module: map[string]string{
 				"child/main.tf": `
 				
@@ -332,15 +326,18 @@ module "child" {
 		},
 
 		"check blocks": {
-			toBeImplemented: true,
 			module: map[string]string{
 				"main.tf": `
 ephemeral "ephem_resource" "data" {}
 
 check "check_using_ephemeral_value" {
   assert {
-    condition = ephemeral.ephem_resource.data.bool
-    error_message = "This should not fail"
+    condition = ephemeral.ephem_resource.data.bool == false
+    error_message = "Fine to persist"
+  }
+  assert {
+    condition = ephemeral.ephem_resource.data.bool == false
+    error_message = "Shall not be persisted ${ephemeral.ephem_resource.data.bool}"
   }
 }
 				`,
@@ -350,10 +347,49 @@ check "check_using_ephemeral_value" {
 			expectCloseEphemeralResourceCalled:          true,
 
 			assertPlan: func(t *testing.T, p *plans.Plan) {
-				// Checks using ephemeral values should not be included in the plan
-				if p.Checks.ConfigResults.Len() > 0 {
-					t.Fatalf("Expected no checks to be included in the plan, but got %d", p.Checks.ConfigResults.Len())
+				key := addrs.ConfigCheck{
+					Module: addrs.RootModule,
+					Check: addrs.Check{
+						Name: "check_using_ephemeral_value",
+					},
 				}
+				result, ok := p.Checks.ConfigResults.GetOk(key)
+				if !ok {
+					t.Fatalf("expected to find check result for %q", key)
+				}
+				objKey := addrs.AbsCheck{
+					Module: addrs.RootModuleInstance,
+					Check: addrs.Check{
+						Name: "check_using_ephemeral_value",
+					},
+				}
+				obj, ok := result.ObjectResults.GetOk(objKey)
+				if !ok {
+					t.Fatalf("expected to find object for %q", objKey)
+				}
+				expectedMessages := []string{"Fine to persist"}
+				if diff := cmp.Diff(expectedMessages, obj.FailureMessages); diff != "" {
+					t.Fatalf("unexpected messages: %s", diff)
+				}
+			},
+			expectPlanDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagWarning,
+					Summary:  "Check block assertion failed",
+					Detail:   "Fine to persist",
+				})
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagWarning,
+					Summary:  "Check block assertion failed",
+					Detail:   "This check failed, but has an invalid error message as described in the other accompanying messages.",
+				})
+				diags = diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagWarning,
+					Summary:  "Error message refers to ephemeral values",
+					Detail: "The error expression used to explain this condition refers to ephemeral values, so Terraform will not display the resulting message." +
+						"\n\nYou can correct this by removing references to ephemeral values, or by using the ephemeralasnull() function on the references to not reveal ephemeral data.",
+				})
+				return diags
 			},
 		},
 
@@ -425,11 +461,96 @@ module "child" {
 				})
 			},
 		},
+		"resource precondition": {
+			module: map[string]string{
+				"main.tf": `
+locals {
+  test_value = 2
+}
+ephemeral "ephem_resource" "data" {
+  lifecycle {
+    precondition {
+      condition = local.test_value != 2
+	  error_message = "value should not be 2"
+    }
+  }
+}
+`,
+			},
+			expectPlanDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
+				return diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Resource precondition failed",
+					Detail:   "value should not be 2",
+				})
+			},
+		},
+		"resource postcondition": {
+			module: map[string]string{
+				"main.tf": `
+locals {
+  test_value = 2
+}
+ephemeral "ephem_resource" "data" {
+  lifecycle {
+    postcondition {
+      condition = self.value == "pass"
+	  error_message = "value should be \"pass\""
+    }
+  }
+}
+`,
+			},
+			expectPlanDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
+				return diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Resource postcondition failed",
+					Detail:   `value should be "pass"`,
+				})
+			},
+		},
+
+		"variable validation": {
+			module: map[string]string{
+				"main.tf": `
+variable "ephem" {
+  type        = string
+  ephemeral   = true
+  
+  validation {
+    condition     = length(var.ephem) > 4
+    error_message = "This should fail but not show the value: ${var.ephem}"
+  }
+}
+  
+output "out" {
+  value = ephemeralasnull(var.ephem)
+}
+`,
+			},
+			inputs: InputValues{
+				"ephem": &InputValue{
+					Value: cty.StringVal("ami"),
+				},
+			},
+			expectPlanDiagnostics: func(m *configs.Config) (diags tfdiags.Diagnostics) {
+				return diags.Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Invalid value for variable",
+					Detail: fmt.Sprintf(`The error message included a sensitive value, so it will not be displayed.
+
+This was checked by the validation rule at %s.`, m.Module.Variables["ephem"].Validations[0].DeclRange.String()),
+				}).Append(&hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Error message refers to ephemeral values",
+					Detail: `The error expression used to explain this condition refers to ephemeral values. Terraform will not display the resulting message.
+
+You can correct this by removing references to ephemeral values, or by carefully using the ephemeralasnull() function if the expression will not reveal the ephemeral data.`,
+				})
+			},
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			if tc.toBeImplemented {
-				t.Skip("To be implemented")
-			}
 			m := testModuleInline(t, tc.module)
 
 			ephem := &testing_provider.MockProvider{
@@ -462,7 +583,7 @@ module "child" {
 						},
 					},
 					Functions: map[string]providers.FunctionDecl{
-						"either": providers.FunctionDecl{
+						"either": {
 							Parameters: []providers.FunctionParam{
 								{
 									Name: "a",
@@ -536,7 +657,12 @@ module "child" {
 				}
 			}
 
-			plan, diags := ctx.Plan(m, nil, DefaultPlanOpts)
+			inputs := tc.inputs
+			if inputs == nil {
+				inputs = InputValues{}
+			}
+
+			plan, diags := ctx.Plan(m, nil, SimplePlanOpts(plans.NormalMode, inputs))
 			if tc.expectPlanDiagnostics != nil {
 				assertDiagnosticsSummaryAndDetailMatch(t, diags, tc.expectPlanDiagnostics(m))
 			} else {
@@ -559,5 +685,86 @@ module "child" {
 				}
 			}
 		})
+	}
+}
+
+func TestContext2Apply_ephemeralUnknownPlan(t *testing.T) {
+	m := testModuleInline(t, map[string]string{
+		"main.tf": `
+resource "test_instance" "test" {
+}
+
+ephemeral "ephem_resource" "data" {
+  input = test_instance.test.id
+  lifecycle {
+    postcondition {
+      condition = self.value != nil
+      error_message = "should return a value"
+    }
+  }
+}
+
+locals {
+  value = ephemeral.ephem_resource.data.value
+}
+
+// create a sink for the ephemeral value to test
+provider "sink" {
+  test_string = local.value
+}
+
+// we need a resource to ensure the sink provider is configured
+resource "sink_object" "empty" {
+}
+`,
+	})
+
+	ephem := &testing_provider.MockProvider{
+		GetProviderSchemaResponse: &providers.GetProviderSchemaResponse{
+			EphemeralResourceTypes: map[string]providers.Schema{
+				"ephem_resource": {
+					Block: &configschema.Block{
+						Attributes: map[string]*configschema.Attribute{
+							"value": {
+								Type:     cty.String,
+								Computed: true,
+							},
+							"input": {
+								Type:     cty.String,
+								Required: true,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	sink := simpleMockProvider()
+	sink.GetProviderSchemaResponse.ResourceTypes = map[string]providers.Schema{
+		"sink_object": {Block: simpleTestSchema()},
+	}
+	sink.ConfigureProviderFn = func(req providers.ConfigureProviderRequest) (resp providers.ConfigureProviderResponse) {
+		if req.Config.GetAttr("test_string").IsKnown() {
+			t.Error("sink provider config should not be known in this test")
+		}
+		return resp
+	}
+
+	p := testProvider("test")
+
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[addrs.Provider]providers.Factory{
+			addrs.NewDefaultProvider("ephem"): testProviderFuncFixed(ephem),
+			addrs.NewDefaultProvider("test"):  testProviderFuncFixed(p),
+			addrs.NewDefaultProvider("sink"):  testProviderFuncFixed(sink),
+		},
+	})
+
+	_, diags := ctx.Plan(m, nil, DefaultPlanOpts)
+	assertNoDiagnostics(t, diags)
+
+	if ephem.OpenEphemeralResourceCalled {
+		t.Error("OpenEphemeralResourceCalled called when config was not known")
 	}
 }
